@@ -1,0 +1,7 @@
+---
+import Page from '../../components/Page.astro';
+export function getStaticPaths() {
+  return ['guide', 'deep/topic'].map(slug => ({ params: { slug } }));
+}
+---
+<Page page={`/docs/${Astro.params.slug}/`} />

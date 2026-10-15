@@ -1,0 +1,31 @@
+name: gate
+on:
+  push:
+  pull_request:
+jobs:
+  linux-amd64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.2
+          cache: npm
+      - name: Install pinned Rust toolchain (from rust-toolchain.toml)
+        run: rustup show
+      - name: Verify Rust components (rustfmt, clippy)
+        run: |
+          rustup component add rustfmt clippy
+          cargo fmt --version
+          cargo clippy --version
+      - run: npm ci
+      - run: npm run build
+      - run: npm run gate
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/astro-link-integration-evidence
+          ASTRO_TELEMETRY_DISABLED: '1'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: integration-evidence-linux-amd64
+          path: ${{ runner.temp }}/astro-link-integration-evidence

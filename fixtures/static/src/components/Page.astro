@@ -1,0 +1,21 @@
+---
+import { childrenOf, breadcrumbsOf, parentOf } from 'astro-cms-internal-link-structure';
+import { structure, href, key } from '../../structure.mjs';
+const { page } = Astro.props;
+const path = key(page);
+const parent = parentOf(structure, path);
+const crumbs = breadcrumbsOf(structure, path);
+const children = childrenOf(structure, path);
+const isFile = process.env.FORMAT === 'file';
+const pageEndsWithSlash = isFile ? false : process.env.SLASH !== 'never';
+const relative = isFile ? 'docs/guide.html#details' : (pageEndsWithSlash ? 'guide/#details' : 'guide#details');
+---
+<!doctype html><html lang="en"><head><meta charset="utf-8"/><title>{structure.labels[path]}</title><link rel="stylesheet" href={href(key('/style.css'))} /></head><body>
+<nav aria-label="Breadcrumb">{crumbs.map(item => <a href={href(item.path)}>{item.label}</a>)}</nav>
+<main><h1>{structure.labels[path]}</h1><h2 id="details">Details</h2>
+{parent && <a href={href(parent.path)}>Parent: {parent.label}</a>}
+<ul>{children.map(item => <li><a href={href(item.path)}>{item.label}</a></li>)}</ul>
+{page === '/docs/' && <a href={relative}>Relative guide details</a>}
+<a href="#details">This page section</a><a href={href(key('/download.txt'))}>Download asset</a>
+{process.env.BROKEN && <><a href={href(key('/missing/'))}>Missing page</a><a href="#absent">Missing section</a></>}
+</main></body></html>

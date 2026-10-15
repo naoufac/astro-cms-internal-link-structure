@@ -1,0 +1,19 @@
+{
+  "name": "astro-cms-internal-link-structure",
+  "version": "0.1.0",
+  "description": "Read-only static Astro internal link auditing backed by a native Rust engine",
+  "type": "module",
+  "license": "MIT",
+  "author": "naoufac",
+  "engines": { "node": ">=22.12.0" },
+  "exports": { ".": { "types": "./js/index.d.ts", "import": "./js/index.js" } },
+  "files": ["js/", "native/", "scripts/", "src/", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "RUST-API.md", "README.md", "LICENSE"],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test test/*.mjs",
+    "test:types": "tsc --noEmit --strict --module NodeNext --moduleResolution NodeNext --target ES2022 --skipLibCheck scripts/types.ts",
+    "gate": "node scripts/gate.mjs"
+  },
+  "peerDependencies": { "astro": "7.3.5" },
+  "devDependencies": { "astro": "7.3.5", "typescript": "5.9.3", "@types/node": "22.19.15" }
+}

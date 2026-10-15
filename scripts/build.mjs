@@ -1,0 +1,14 @@
+import { spawnSync } from 'node:child_process';
+import { mkdirSync, copyFileSync, chmodSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
+const root = fileURLToPath(new URL('../', import.meta.url));
+const result = spawnSync('cargo', ['build', '--release', '--locked'], { cwd: root, stdio: 'inherit', shell: false });
+if (result.error) throw result.error;
+if (result.status !== 0) process.exit(result.status ?? 1);
+const name = `astro-cms-internal-link-structure${process.platform === 'win32' ? '.exe' : ''}`;
+const destination = join(root, 'native', `${process.platform}-${process.arch}`);
+mkdirSync(destination, { recursive: true });
+copyFileSync(join(root, 'target', 'release', name), join(destination, name));
+chmodSync(join(destination, name), 0o755);
+console.log(`Native engine compiled and copied to ${join(destination, name)}`);

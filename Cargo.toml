@@ -1,0 +1,17 @@
+[package]
+name = "astro-cms-internal-link-structure"
+version = "0.1.0"
+edition = "2021"
+description = "Internal link structure engine for static Astro sites"
+license = "MIT"
+
+[dependencies]
+scraper = "0.27.0"
+ego-tree = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2.5.8"
+percent-encoding = "2.3.2"
+
+[profile.release]
+opt-level = 3
