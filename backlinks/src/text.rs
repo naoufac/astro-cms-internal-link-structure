@@ -58,6 +58,9 @@ pub fn contains_word(haystack: &str, needle: &str) -> bool {
             return true;
         }
         last = start + 1;
+        while last < hay.len() && !hay.is_char_boundary(last) {
+            last += 1;
+        }
         if last >= hay.len() {
             break;
         }
@@ -313,6 +316,17 @@ mod tests {
         assert!(!contains_word("gissecretspro", "gissecrets"));
         assert!(!contains_word("agissecrets", "gissecrets"));
         assert!(contains_word("À propos de Café", "café"));
+    }
+
+    #[test]
+    fn multilingual_needle_inside_longer_word_does_not_panic() {
+        assert!(!contains_word("水文站水网", "水网"));
+        assert!(contains_word("长江 水网", "水网"));
+        assert!(!contains_word("αααβ", "αα"));
+        assert!(contains_word("αα αα", "αα"));
+        assert!(!contains_word("caféiné", "é"));
+        assert!(!contains_word("aaa", "aa"));
+        assert!(!contains_word("水水水站", "水水"));
     }
 
     #[test]

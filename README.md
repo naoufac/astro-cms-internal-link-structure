@@ -11,8 +11,8 @@ The engine and the Astro integration share one URL model:
 - Static output only. `output: 'server'` and `build.format: 'preserve'` throw.
 - Page keys follow the real emitted routes. Directory format keys end with a slash (`/docs/guide/`); file format keys do not (`/docs/guide`); the site root is `/` in both. Keys carry the `base` prefix: with `base: '/knowledge'`, the root page key is `/knowledge/` (directory) or `/knowledge` (file).
 - `site` must be a bare HTTP(S) origin. Deployment prefixes belong in Astro `base`, never in `site`.
-- `trailingSlash` controls link hrefs and the per-page document URL used for relative resolution: `always` resolves relative links against a slash-terminated document URL, `never` against a slashless one, `ignore` follows the build format (slash for directory, no slash for file). This matches what a browser does with the served page URL.
-- Resolved link paths are normalized to the page-key form for the configured `buildFormat` before classification, so `/docs`, `/docs/` and (file format) `/docs.html` all classify against the same emitted page where the format and trailingSlash policy make them equivalent. Absolute hrefs on the configured origin, root-relative hrefs and relative hrefs all resolve through this same model.
+- Relative hrefs resolve against each page's emitted-document URL, which the build format alone determines: file format document URLs always carry the `.html` suffix (the site root is `<base>/index.html`), directory format document URLs always end with a slash. This is the public path of the emitted HTML file. `trailingSlash` is captured, validated and echoed in the report config; it does not change document URLs or link classification. Tolerant URL aliases of an emitted page are accepted during artifact resolution and classification only; the engine performs no server redirect or HTTP status validation.
+- Resolved link paths are normalized to the page-key form for the configured `buildFormat` before classification, so `/docs`, `/docs/` and (file format) `/docs.html` all classify against the same emitted page where the format makes them equivalent. Absolute hrefs on the configured origin, root-relative hrefs and relative hrefs all resolve through this same model.
 - Asset links (for example `/style.css`, `/download.txt`) are checked against emitted files. Fragments are checked against element ids and named anchors in the target page.
 
 ## Build from source
@@ -153,7 +153,7 @@ The report is deterministic for identical artifacts and configuration. Top-level
 - `edges`: `{source, target, href, landmark, rel}` per internal page-to-page link, where `target` is the normalized page key.
 - `issues`: `brokenPaths` (`{source, href, resolved, reason}`), `brokenFragments` (`{source, href, target, fragment, reason}`), `external` (origin to source/href list), `special` (mailto/tel/unparseable/outside-base hrefs).
 - `hierarchy`: `configured`, `cycles`, `missingParents`, `violations` (`{kind, page, related, detail}`) for missing child-to-parent links, missing parent-to-child links, missing breadcrumbs, cycles and unknown parents.
-- `opportunities`: engine-derived advisory records (`{kind, source, target, detail}`), for example configured siblings that are not cross-linked.
+- `opportunities`: engine-derived advisory records (`{kind, source, target, detail}`). `hierarchy` records a missing configured child-to-parent or parent-to-child link. `contextual` records a source page whose visible unlinked body text contains the target's own label (or `<title>` as fallback) verbatim as a phrase of at least two words, with source and target eligible, distinct and not already linked; sibling relations and URL similarity are never used as evidence.
 - `gates`: `mode`, `outcomes` (`{name, observed, limit, violated}`) and `violated`.
 
 Reports can contain private page text and paths; keep them out of public output and review before sharing.
