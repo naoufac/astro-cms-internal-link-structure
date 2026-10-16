@@ -6,7 +6,7 @@ fn default_label() -> String {
     String::new()
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HierarchyConfig {
     /// Explicit child page path -> parent page path. Authoritative.

@@ -7,11 +7,17 @@
 
 pub mod audit;
 pub mod cli;
+pub mod contextual;
 pub mod gates;
 pub mod graph;
 pub mod hierarchy;
+#[cfg(test)]
+mod improvements_tests;
 pub mod links;
+pub mod local_sitemap;
+pub mod metadata;
 pub mod parser;
 pub mod request;
 pub mod scan;
 pub mod sitemap;
+pub mod visible;

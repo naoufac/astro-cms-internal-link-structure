@@ -101,7 +101,10 @@ pub fn page_links_to_owned_domain(
         };
         if let Some(h) = abs.host_str() {
             if let Ok(ascii) = host_to_ascii(h) {
-                if owned_hosts.contains(&ascii) {
+                if owned_hosts
+                    .iter()
+                    .any(|d| crate::competitors::within(&ascii, d))
+                {
                     return true;
                 }
             }
@@ -199,6 +202,7 @@ pub fn build_broken_link_opportunity(
     topic_evidence: &str,
 ) -> Opportunity {
     Opportunity {
+        competitor_evidence: None,
         rule: RULE_BROKEN_LINK.to_string(),
         rule_version: RULE_ENGINE_VERSION.to_string(),
         source_url: facts.source_url.clone(),
@@ -278,6 +282,7 @@ pub fn analyze_page(html: &str, facts: &PageFacts) -> PageAnalysis {
             let _ = &topic_hit;
             if let Some(quote) = sentence_containing(html, brand) {
                 mention = Some(Opportunity {
+                    competitor_evidence: None,
                     rule: RULE_MENTION.to_string(),
                     rule_version: RULE_ENGINE_VERSION.to_string(),
                     source_url: facts.source_url.clone(),
@@ -326,6 +331,7 @@ pub fn analyze_page(html: &str, facts: &PageFacts) -> PageAnalysis {
                 };
             };
             curated = Some(Opportunity {
+                competitor_evidence: None,
                 rule: RULE_RESOURCE_PAGE.to_string(),
                 rule_version: RULE_ENGINE_VERSION.to_string(),
                 source_url: facts.source_url.clone(),

@@ -1,10 +1,14 @@
 //! Backlink opportunities detector: library facade.
 
+#[cfg(test)]
+mod competitor_tests;
+pub mod competitors;
 pub mod detector;
 pub mod evidence;
 pub mod fetch;
 #[cfg(test)]
 pub mod fetch_tests;
+pub mod gap;
 pub mod import;
 pub mod neturl;
 pub mod queries;

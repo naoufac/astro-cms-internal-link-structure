@@ -18,8 +18,6 @@ pub const EXIT_OK: i32 = 0;
 pub const EXIT_VIOLATIONS: i32 = 1;
 pub const EXIT_FAILURE: i32 = 2;
 
-const CONTEXTUAL_OPPORTUNITY_CAP: usize = 200;
-
 #[derive(Debug, Serialize)]
 pub struct BrokenPathIssue {
     pub source: String,
@@ -43,6 +41,8 @@ pub struct EdgeRecord {
     pub target: String,
     pub href: String,
     pub landmark: String,
+    pub editorial: bool,
+    pub anchor: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub rel: Vec<String>,
 }
@@ -79,6 +79,17 @@ pub struct Report {
     pub hierarchy: HierarchyResult,
     pub opportunities: Vec<Opportunity>,
     pub gates: GateReport,
+    pub sitemap: crate::local_sitemap::SitemapReport,
+    pub anchorFindings: Vec<AnchorFinding>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AnchorFinding {
+    pub kind: String,
+    pub source: String,
+    pub target: String,
+    pub anchor: String,
+    pub detail: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -102,6 +113,7 @@ pub struct ReportConfig {
     pub buildFormat: String,
     pub mode: String,
     pub entrypoints: Vec<String>,
+    pub auditScope: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -113,6 +125,11 @@ pub struct NodeRecord {
     pub orphan: bool,
     pub unreachable: bool,
     pub inCycle: bool,
+    pub editorialDepth: Option<usize>,
+    pub editorialOrphan: bool,
+    pub editorialUnreachable: bool,
+    pub editorialSources: usize,
+    pub metadata: Option<crate::metadata::Metadata>,
 }
 
 #[derive(Debug, Serialize)]
@@ -313,6 +330,7 @@ pub fn run_prepared(p: &Prepared) -> Result<Report, String> {
     }
 
     let mut graph = Graph::new();
+    let mut editorial = Graph::new();
     let mut edges: Vec<EdgeRecord> = Vec::new();
     let mut broken_paths: Vec<BrokenPathIssue> = Vec::new();
     let mut broken_fragments: Vec<FragmentIssue> = Vec::new();
@@ -338,6 +356,17 @@ pub fn run_prepared(p: &Prepared) -> Result<Report, String> {
         }
     }
 
+    let metadata: BTreeMap<_, _> = page_links
+        .iter()
+        .map(|(key, page)| {
+            (
+                key.clone(),
+                crate::metadata::assess(key, page, &p.site, &inv),
+            )
+        })
+        .collect();
+    let sitemap = crate::local_sitemap::audit(&p.root, &p.site, &inv, &metadata);
+
     // Cross-page fragment validation needs the parsed links of targets; all
     // pages are parsed above, so consult page_links directly.
     for (key, _) in &sorted {
@@ -346,6 +375,7 @@ pub fn run_prepared(p: &Prepared) -> Result<Report, String> {
             None => continue,
         };
         graph.add_node((*key).clone());
+        editorial.add_node((*key).clone());
         for dl in &pl.links {
             let u = match resolve_href(&p.site, key, &dl.href) {
                 Some(u) => u,
@@ -380,12 +410,17 @@ pub fn run_prepared(p: &Prepared) -> Result<Report, String> {
                     let is_nofollow = dl.rel.iter().any(|r| r == "nofollow");
                     if !is_nofollow {
                         graph.add_edge(key, &target);
+                        if dl.editorial {
+                            editorial.add_edge(key, &target);
+                        }
                     }
                     edges.push(EdgeRecord {
                         source: (*key).clone(),
                         target: target.clone(),
                         href: dl.href.clone(),
                         landmark: dl.landmark.clone(),
+                        editorial: dl.editorial,
+                        anchor: dl.anchor.clone(),
                         rel: dl.rel.clone(),
                     });
                     if let Some(f) = frag {
@@ -454,6 +489,39 @@ pub fn run_prepared(p: &Prepared) -> Result<Report, String> {
     }
 
     let (depth, _reachable) = graph.bfs(&entrypoints);
+    let (editorial_depth, editorial_reachable) = editorial.bfs(&entrypoints);
+    let editorial_orphans = editorial.orphans();
+    let mut editorial_sources: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut anchor_targets: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for edge in edges.iter().filter(|e| e.editorial) {
+        if !edge.rel.iter().any(|r| r == "nofollow") {
+            editorial_sources
+                .entry(edge.target.clone())
+                .or_default()
+                .insert(edge.source.clone());
+        }
+        if !edge.anchor.is_empty() {
+            anchor_targets
+                .entry(edge.anchor.to_lowercase())
+                .or_default()
+                .insert(edge.target.clone());
+        }
+    }
+    let mut anchor_findings = Vec::new();
+    for edge in edges.iter().filter(|e| e.editorial) {
+        let text = edge.anchor.to_lowercase();
+        let vague = matches!(
+            text.as_str(),
+            "" | "click here" | "here" | "read more" | "learn more" | "more" | "link"
+        );
+        let ambiguous = anchor_targets.get(&text).is_some_and(|t| t.len() > 1);
+        if vague || ambiguous {
+            anchor_findings.push(AnchorFinding {
+            kind: if vague { "vague" } else { "ambiguous" }.into(), source: edge.source.clone(), target: edge.target.clone(), anchor: edge.anchor.clone(),
+            detail: "Advisory: review descriptive editorial anchor text in context; no search penalty inferred".into(),
+        });
+        }
+    }
     let orphans = graph.orphans();
     let unreachable = graph.unreachable(&entrypoints);
     let cyclic = graph.cyclic_nodes();
@@ -556,60 +624,17 @@ pub fn run_prepared(p: &Prepared) -> Result<Report, String> {
                 }
             }
         }
-
-        // Grounded contextual suggestions: a target's supplied label or
-        // title appears as a whole phrase in genuinely visible, unlinked
-        // body text of the source page. URL prefixes and sibling similarity
-        // are never used as evidence. Sources/targets must be eligible,
-        // non-excluded, distinct, and not already linked.
-        let sources: Vec<&String> = eligible.keys().collect();
-        'outer: for src in &sources {
-            if excluded.contains(*src) {
-                continue;
-            }
-            let srec = match eligible.get(*src) {
-                Some(r) => r,
-                None => continue,
-            };
-            for (target, trec) in &eligible {
-                if target == *src || excluded.contains(target) {
-                    continue;
-                }
-                if graph
-                    .edges
-                    .get(src.as_str())
-                    .map(|s| s.contains(target.as_str()))
-                    .unwrap_or(false)
-                {
-                    continue;
-                }
-                let owned_phrase = match hcfg.labels.get(target) {
-                    Some(l) if !l.trim().is_empty() => l.trim().to_string(),
-                    _ => match title_of(&p.root, trec) {
-                        Some(t) if !t.trim().is_empty() => t.trim().to_string(),
-                        _ => continue,
-                    },
-                };
-                let phrase = owned_phrase.as_str();
-                if phrase.split_whitespace().count() < 2 {
-                    continue;
-                }
-                if unlinked_body_mention(&p.root, srec, trec, phrase) {
-                    opportunities.push(Opportunity {
-                        kind: "contextual".to_string(),
-                        source: (**src).clone(),
-                        target: target.clone(),
-                        detail: format!(
-                            "target phrase '{phrase}' appears in visible unlinked body text"
-                        ),
-                    });
-                    if opportunities.len() >= CONTEXTUAL_OPPORTUNITY_CAP {
-                        break 'outer;
-                    }
-                }
-            }
-        }
     }
+    let mut contextual_links = Graph::new();
+    for edge in edges.iter().filter(|e| e.editorial) {
+        contextual_links.add_edge(&edge.source, &edge.target);
+    }
+    opportunities.extend(crate::contextual::suggest(
+        &page_links,
+        &metadata,
+        &contextual_links,
+        p.req.hierarchy.as_ref(),
+    ));
 
     let counts = GateCounts {
         broken_paths: broken_paths.len(),
@@ -632,6 +657,11 @@ pub fn run_prepared(p: &Prepared) -> Result<Report, String> {
             orphan: orphans.contains(k),
             unreachable: unreachable.contains(k),
             inCycle: cyclic.contains(k),
+            editorialDepth: editorial_depth.get(k).copied(),
+            editorialOrphan: editorial_orphans.contains(k),
+            editorialUnreachable: !editorial_reachable.contains(k),
+            editorialSources: editorial_sources.get(k).map_or(0, BTreeSet::len),
+            metadata: metadata.get(k).cloned(),
         })
         .collect();
 
@@ -659,9 +689,12 @@ pub fn run_prepared(p: &Prepared) -> Result<Report, String> {
             buildFormat: format!("{:?}", p.site.build_format).to_lowercase(),
             mode: p.req.mode.clone(),
             entrypoints,
+            auditScope: serde_json::json!({"excludedPages": excluded, "hierarchy": p.req.hierarchy}),
         },
         nodes,
         edges,
+        sitemap,
+        anchorFindings: anchor_findings,
         issues: Issues {
             brokenPaths: broken_paths,
             brokenFragments: broken_fragments,
@@ -775,130 +808,10 @@ fn page_has_breadcrumb_links(
     false
 }
 
-/// Visible <title> text of a page (trimmed), None when unreadable.
-fn title_of(root: &Path, rec: &PageRecord) -> Option<String> {
-    let fs = root.join(rec.filePath.replace('\\', "/"));
-    let data = std::fs::read(&fs).ok()?;
-    let html = std::str::from_utf8(data.as_slice()).ok()?;
-    let doc = scraper::Html::parse_document(html);
-    let sel = scraper::Selector::parse("title").ok()?;
-    let el = doc.select(&sel).next()?;
-    Some(el.text().collect::<String>())
-}
-
-/// True when phrase occurs as a whole phrase in visible body text of the
-/// source page outside nav/footer/aside elements and outside link text.
-fn unlinked_body_mention(root: &Path, srec: &PageRecord, trec: &PageRecord, phrase: &str) -> bool {
-    let _ = trec;
-    let fs = root.join(srec.filePath.replace('\\', "/"));
-    let data = match std::fs::read(&fs) {
-        Ok(d) => d,
-        Err(_) => return false,
-    };
-    let html = match std::str::from_utf8(data.as_slice()) {
-        Ok(h) => h,
-        Err(_) => return false,
-    };
-    if !contains_whole_phrase(&visible_unlinked_text(html), phrase) {
-        return false;
-    }
-    let _ = trec;
-    true
-}
-
-fn contains_whole_phrase(text: &str, phrase: &str) -> bool {
-    let phrase = phrase.trim();
-    if phrase.is_empty() {
-        return false;
-    }
-    for (i, _) in text.match_indices(phrase) {
-        let before_ok = text[..i]
-            .chars()
-            .next_back()
-            .map(|c| !(c.is_alphanumeric() || c == '_'))
-            .unwrap_or(true);
-        let after = i + phrase.len();
-        let after_ok = text[after..]
-            .chars()
-            .next()
-            .map(|c| !(c.is_alphanumeric() || c == '_'))
-            .unwrap_or(true);
-        if before_ok && after_ok {
-            return true;
-        }
-    }
-    false
-}
-
-fn visible_unlinked_text(html: &str) -> String {
-    let doc = scraper::Html::parse_document(html);
-    let mut excluded: BTreeSet<ego_tree::NodeId> = BTreeSet::new();
-    for sel_str in [
-        "script",
-        "style",
-        "template",
-        "noscript",
-        "nav",
-        "footer",
-        "aside",
-        "header",
-        "a",
-        "title",
-        "head",
-        "[hidden]",
-        "[aria-hidden=\"true\"]",
-    ] {
-        if let Ok(sel) = scraper::Selector::parse(sel_str) {
-            for el in doc.select(&sel) {
-                excluded.insert(el.id());
-            }
-        }
-    }
-    if let Ok(all) = scraper::Selector::parse("*") {
-        for el in doc.select(&all) {
-            let Some(style) = el.value().attr("style") else {
-                continue;
-            };
-            let hidden = style.to_ascii_lowercase().split(';').any(|decl| {
-                let mut parts = decl.splitn(2, ':');
-                let prop = parts.next().unwrap_or("").trim();
-                let raw = parts.next().unwrap_or("").trim();
-                let val = raw.strip_suffix("!important").unwrap_or(raw).trim();
-                matches!((prop, val), ("display", "none") | ("visibility", "hidden"))
-            });
-            if hidden {
-                excluded.insert(el.id());
-            }
-        }
-    }
-    let mut out = String::new();
-    walk_visible(doc.root_element(), &excluded, &mut out);
-    out
-}
-
-fn walk_visible(
-    node: scraper::element_ref::ElementRef<'_>,
-    excluded: &BTreeSet<ego_tree::NodeId>,
-    out: &mut String,
-) {
-    for child in node.children() {
-        match child.value() {
-            scraper::node::Node::Text(t) => out.push_str(&t.text),
-            scraper::node::Node::Element(_) => {
-                if let Some(el) = scraper::ElementRef::wrap(child) {
-                    if !excluded.contains(&el.id()) {
-                        walk_visible(el, excluded, out);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contextual::whole_phrase as contains_whole_phrase;
 
     fn tmpdir(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("ails-audit-{name}-{}", std::process::id()));

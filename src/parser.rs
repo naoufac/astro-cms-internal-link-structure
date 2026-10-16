@@ -12,12 +12,18 @@ pub struct DomLink {
     pub rel: Vec<String>,
     pub ordinal: usize,
     pub landmark: String,
+    pub editorial: bool,
+    pub anchor: String,
 }
 
 pub struct PageLinks {
     pub links: Vec<DomLink>,
     pub ids: BTreeMap<String, usize>,
     pub named_anchors: BTreeMap<String, usize>,
+    pub canonicals: Vec<String>,
+    pub robots: BTreeMap<String, Vec<String>>,
+    pub title: String,
+    pub unlinked: String,
 }
 
 fn nearest_landmark(el: &ElementRef) -> String {
@@ -58,6 +64,8 @@ pub fn extract(html: &str) -> PageLinks {
             rel,
             ordinal,
             landmark,
+            editorial: crate::visible::editorial(el),
+            anchor: crate::visible::anchor(el),
         });
     }
     for el in doc.select(&id_sel) {
@@ -70,10 +78,39 @@ pub fn extract(html: &str) -> PageLinks {
             *named.entry(n.to_string()).or_insert(0) += 1;
         }
     }
+    let canonicals = doc
+        .select(&Selector::parse("link[rel]").unwrap())
+        .filter(|e| {
+            e.attr("rel")
+                .unwrap_or("")
+                .split_whitespace()
+                .any(|r| r.eq_ignore_ascii_case("canonical"))
+        })
+        .map(|e| e.attr("href").unwrap_or("").to_string())
+        .collect();
+    let mut robots: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for el in doc.select(&Selector::parse("meta[name]").unwrap()) {
+        let name = el.attr("name").unwrap_or("").to_ascii_lowercase();
+        if matches!(name.as_str(), "robots" | "googlebot") {
+            robots
+                .entry(name)
+                .or_default()
+                .push(el.attr("content").unwrap_or("").to_string());
+        }
+    }
+    let title = doc
+        .select(&Selector::parse("title").unwrap())
+        .next()
+        .map(|e| crate::visible::normalize(&e.text().collect::<String>()))
+        .unwrap_or_default();
     PageLinks {
         links,
         ids,
         named_anchors: named,
+        canonicals,
+        robots,
+        title,
+        unlinked: crate::visible::unlinked(&doc),
     }
 }
 

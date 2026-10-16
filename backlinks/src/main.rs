@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::process::ExitCode;
 
 use backlink_opportunities_detector::{
-    import::parse_candidates, queries::generate_queries, report::DetectorConfig,
-    runner::run_detection, transport::PinnedReqwestTransport,
+    competitors::parse_backlinks, import::parse_candidates, queries::generate_queries,
+    report::DetectorConfig, runner::run_detection, transport::PinnedReqwestTransport,
 };
 
 const USAGE: &str = r#"backlink-opportunities-detector: evidence-backed backlink opportunity detection
@@ -16,6 +16,7 @@ SUBCOMMANDS:
       topics. Execute them in your OWN search tool; nothing is fetched here.
 
   detect --config <config.json> --candidates <results.json> --output <report.json>
+  detect --config <config.json> --backlinks <backlinks.json> --output <report.json>
       Run the detector over imported candidates. Network is opt-in via
       config.network.enabled; evidence captures go to config.network.evidence_dir.
 
@@ -109,9 +110,13 @@ fn run_detect(opts: &HashMap<String, String>) -> Result<ExitCode, String> {
     let cfg_path = opts
         .get("config")
         .ok_or_else(|| "--config <config.json> is required".to_string())?;
+    if opts.contains_key("candidates") == opts.contains_key("backlinks") {
+        return Err("Supply exactly one of --candidates or --backlinks".into());
+    }
     let cand_path = opts
         .get("candidates")
-        .ok_or_else(|| "--candidates <results.json> is required".to_string())?;
+        .or_else(|| opts.get("backlinks"))
+        .unwrap();
     let out_path = opts
         .get("output")
         .ok_or_else(|| "--output <report.json> is required".to_string())?;
@@ -119,9 +124,14 @@ fn run_detect(opts: &HashMap<String, String>) -> Result<ExitCode, String> {
 
     let text = std::fs::read_to_string(cand_path)
         .map_err(|e| format!("cannot read candidates '{cand_path}': {e}"))?;
-    let (candidates, dedupe) =
-        parse_candidates(&text).map_err(|e| format!("invalid candidates file: {e}"))?;
-    if dedupe.unique == 0 {
+    let candidates = if opts.contains_key("backlinks") {
+        parse_backlinks(&text, &config).map_err(|e| format!("invalid backlink import: {e}"))?
+    } else {
+        parse_candidates(&text)
+            .map_err(|e| format!("invalid candidates file: {e}"))?
+            .0
+    };
+    if candidates.is_empty() {
         eprintln!("no usable candidates in '{cand_path}'; writing honest empty report");
     }
 

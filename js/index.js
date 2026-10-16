@@ -1,8 +1,11 @@
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { resolve, dirname, relative, isAbsolute, join } from 'node:path';
-import { mkdir, writeFile, realpath } from 'node:fs/promises';
+import { mkdir, writeFile, realpath, readFile } from 'node:fs/promises';
 import { defineStructure } from './structure.js';
+import { summarizeReport, formatSummary } from './reporting.js';
+import { prioritizeGsc } from './gsc.js';
+export { summarizeReport, formatSummary, prioritizeGsc };
 export { defineStructure, parentOf, childrenOf, breadcrumbsOf } from './structure.js';
 
 export class AuditError extends Error {
@@ -10,7 +13,7 @@ export class AuditError extends Error {
     super(message, { cause }); this.name = 'AuditError'; this.report = report; this.exitCode = exitCode;
   }
 }
-const fields = new Set(['artifactRoot', 'site', 'originAliases', 'basePath', 'trailingSlash', 'buildFormat', 'mode', 'entrypoints', 'exclude', 'excludePagePaths', 'hierarchy', 'thresholds', 'reportPath', 'binaryPath', 'timeoutMs']);
+const fields = new Set(['artifactRoot', 'site', 'originAliases', 'basePath', 'trailingSlash', 'buildFormat', 'mode', 'entrypoints', 'exclude', 'excludePagePaths', 'hierarchy', 'thresholds', 'reportPath', 'binaryPath', 'timeoutMs', 'reportFormat', 'fullReportPath', 'summaryPath', 'baselinePath', 'gscPath', 'gscMinImpressions', 'publicDir']);
 function data(value, name) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || ![null, Object.prototype].includes(Object.getPrototypeOf(value))) throw new TypeError(`${name} must be a plain object`);
   for (const key of Reflect.ownKeys(value)) if (typeof key !== 'string' || !('value' in Object.getOwnPropertyDescriptor(value, key))) throw new TypeError(`${name} must contain data properties only`);
@@ -33,7 +36,9 @@ function options(input) {
   data(input, 'options');
   for (const key of Object.keys(input)) if (!fields.has(key)) throw new TypeError(`Unknown option: ${key}`);
   const result = { ...input };
-  for (const key of ['artifactRoot', 'reportPath', 'binaryPath']) if (result[key] !== undefined) text(result[key], key);
+  for (const key of ['artifactRoot', 'reportPath', 'binaryPath', 'fullReportPath', 'summaryPath', 'baselinePath', 'gscPath', 'publicDir']) if (result[key] !== undefined) text(result[key], key);
+  if (result.reportFormat !== undefined && !['compact', 'full'].includes(result.reportFormat)) throw new TypeError('reportFormat must be compact or full');
+  if (result.gscMinImpressions !== undefined && (!Number.isSafeInteger(result.gscMinImpressions) || result.gscMinImpressions < 1)) throw new TypeError('gscMinImpressions must be a positive integer');
   if (result.site !== undefined) result.site = origin(result.site);
   if (result.basePath !== undefined) result.basePath = base(result.basePath);
   for (const [key, valid] of [['mode', ['audit', 'enforce']], ['buildFormat', ['directory', 'file']], ['trailingSlash', ['always', 'never', 'ignore']]]) {
@@ -98,7 +103,18 @@ export async function auditArtifacts(input) {
   if (!config.artifactRoot || !config.site) throw new TypeError('artifactRoot and site are required');
   const root = resolve(config.artifactRoot);
   const reportPath = resolve(config.reportPath ?? join(dirname(root), '.astro-link-reports', 'report.json'));
-  await outside(reportPath, [root]);
+  const summaryPath = resolve(config.summaryPath ?? `${reportPath}.txt`);
+  const outputs = [reportPath, summaryPath, ...(config.fullReportPath ? [resolve(config.fullReportPath)] : [])];
+  const targets = [];
+  for (const path of outputs) {
+    await outside(path, [root, config.publicDir ?? join(dirname(root), 'public')]);
+    const target = await canonical(path);
+    if (targets.includes(target)) throw new TypeError('Output paths must be distinct');
+    targets.push(target);
+  }
+  for (const path of [config.baselinePath, config.gscPath, config.binaryPath].filter(Boolean)) if (targets.includes(await canonical(resolve(path)))) throw new TypeError('Output paths must not overwrite inputs');
+  const baseline = config.baselinePath ? JSON.parse(await readFile(resolve(config.baselinePath), 'utf8')) : undefined;
+  const gscInput = config.gscPath ? JSON.parse(await readFile(resolve(config.gscPath), 'utf8')) : undefined;
   const request = {
     schemaVersion: '1', artifactRoot: root, site: config.site,
     originAliases: config.originAliases ?? [], basePath: config.basePath ?? '',
@@ -111,8 +127,12 @@ export async function auditArtifacts(input) {
   const binary = config.binaryPath ? resolve(config.binaryPath) : fileURLToPath(new URL(`../native/${process.platform}-${process.arch}/astro-cms-internal-link-structure${process.platform === 'win32' ? '.exe' : ''}`, import.meta.url));
   const { report, exitCode, bytes } = await execute(binary, request, config.timeoutMs ?? 120_000);
   if (report?.schema !== '1' || typeof report?.gates?.violated !== 'boolean' || typeof report?.coverage?.complete !== 'boolean') throw new AuditError('Native engine returned an unsupported report');
-  await mkdir(dirname(reportPath), { recursive: true });
-  await writeFile(reportPath, bytes, 'utf8');
+  const gsc = gscInput === undefined ? undefined : prioritizeGsc(report, gscInput, { minImpressions: config.gscMinImpressions });
+  const summary = summarizeReport(report, { baseline, gsc });
+  for (const path of outputs) await mkdir(dirname(path), { recursive: true });
+  await writeFile(reportPath, config.reportFormat === 'full' ? bytes : JSON.stringify(summary, null, 2) + '\n', 'utf8');
+  await writeFile(summaryPath, formatSummary(summary), 'utf8');
+  if (config.fullReportPath) await writeFile(resolve(config.fullReportPath), bytes, 'utf8');
   if (!report.coverage.complete) throw new AuditError(`Native scan incomplete; report: ${reportPath}`, { report, exitCode });
   if (exitCode === 1 || (request.mode === 'enforce' && report.gates.violated)) throw new AuditError(`Internal link thresholds violated; report: ${reportPath}`, { report, exitCode: 1 });
   return report;
@@ -120,6 +140,7 @@ export async function auditArtifacts(input) {
 export function internalLinkStructure(input = {}) {
   const config = options(input);
   if (config.artifactRoot !== undefined) throw new TypeError('Astro artifactRoot is supplied by build:done, not integration options');
+  if (config.publicDir !== undefined) throw new TypeError('Astro publicDir is supplied by config:done');
   let captured;
   return {
     name: 'astro-cms-internal-link-structure',
@@ -133,16 +154,20 @@ export function internalLinkStructure(input = {}) {
         const root = fileURLToPath(astro.root);
         const reportPath = resolve(root, config.reportPath ?? '.astro-link-reports/report.json');
         const publicDir = fileURLToPath(astro.publicDir);
-        await outside(reportPath, [fileURLToPath(astro.outDir), publicDir]);
-        captured = { ...config, ...values, reportPath, publicDir };
+        const paths = { reportPath, summaryPath: resolve(root, config.summaryPath ?? `${reportPath}.txt`) };
+        for (const key of ['fullReportPath', 'baselinePath', 'gscPath']) if (config[key]) paths[key] = resolve(root, config[key]);
+        for (const key of ['reportPath', 'summaryPath', 'fullReportPath']) if (paths[key]) await outside(paths[key], [fileURLToPath(astro.outDir), publicDir]);
+        captured = { ...config, ...values, ...paths, publicDir };
       },
       'astro:build:done': async ({ dir, logger }) => {
         if (!captured) throw new Error('Astro config:done did not run');
-        const { publicDir, ...audit } = captured;
+        const audit = captured;
+        const { publicDir } = audit;
         const artifactRoot = fileURLToPath(dir);
         await outside(audit.reportPath, [artifactRoot, publicDir]);
         const report = await auditArtifacts({ ...audit, artifactRoot });
-        logger.info(`Audited ${report.coverage.scannedPages} pages; thresholds ${report.gates.violated ? 'violated (audit mode)' : 'passed'}; report: ${audit.reportPath}`);
+        const persisted = JSON.parse(await readFile(audit.reportPath, 'utf8'));
+        logger.info(formatSummary(persisted.schema === 'astro-link-summary/1' ? persisted : summarizeReport(report)) + `Report: ${audit.reportPath}; summary: ${audit.summaryPath}`);
       },
     },
   };

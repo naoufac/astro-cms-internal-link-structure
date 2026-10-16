@@ -110,6 +110,7 @@ mod tests {
                 topics: vec!["tarot".into(), "slavic mythology".into()],
             }],
             excluded_domains: vec![],
+            competitor_domains: vec![],
             limits: Limits::default(),
             network: NetworkPolicy::default(),
         }

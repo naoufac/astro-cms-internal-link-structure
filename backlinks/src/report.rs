@@ -45,6 +45,8 @@ pub struct DetectorConfig {
     #[serde(default)]
     pub excluded_domains: Vec<String>,
     #[serde(default)]
+    pub competitor_domains: Vec<String>,
+    #[serde(default)]
     pub limits: Limits,
     /// Opt-in network switch. When false the detect subcommand performs NO
     /// network I/O and only analyzes inline/imported fixture payloads.
@@ -228,6 +230,29 @@ pub struct Opportunity {
     pub observed_facts: Vec<String>,
     /// Explicitly labeled inference (topic fit, placement suitability).
     pub inferred_assessment: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub competitor_evidence: Option<CompetitorEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompetitorEvidence {
+    pub domains: Vec<String>,
+    pub links: Vec<CompetitorLink>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompetitorLink {
+    pub domain: String,
+    pub url: String,
+    pub quote: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BacklinkHint {
+    pub source_url: String,
+    pub competitor_url: String,
+    pub provenance: String,
 }
 
 /// A candidate source page's full audit trail.
@@ -316,6 +341,8 @@ pub struct RunReport {
     /// Free-form audit info (e.g. import transform provenance).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub audit: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub backlink_imports: BTreeMap<String, Vec<BacklinkHint>>,
 }
 
 /// One imported candidate from a provider-neutral search-result file.
@@ -336,6 +363,8 @@ pub struct ImportedCandidate {
     pub search_snippet: Option<String>,
     #[serde(default)]
     pub suggested_target: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backlink_hints: Vec<BacklinkHint>,
 }
 
 #[derive(Debug, Serialize)]

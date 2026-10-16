@@ -27,7 +27,7 @@ test('real native bridge: audit succeeds, enforce writes report before rejecting
   assert.equal(JSON.parse(await readFile(config.reportPath, 'utf8')).gates.mode, 'enforce');
 });
 test('engine request/response passed through exactly, CLI exit codes remain 0/1/2', async () => {
-  const config = await fixture();
+  const config = { ...await fixture(), reportFormat: 'full' };
   const request = { schemaVersion: '1', artifactRoot: config.artifactRoot, site: config.site, originAliases: [], basePath: '', trailingSlash: 'ignore', buildFormat: 'directory', mode: 'audit', entrypoints: ['/'], exclude: [], excludePagePaths: [], hierarchy: null, thresholds: { brokenPaths: 0, brokenFragments: 0, hierarchyViolations: 0 } };
   const direct = run('native-direct-audit', binary, [], { input: JSON.stringify(request) });
   assert.equal(direct.status, 0, direct.stderr);

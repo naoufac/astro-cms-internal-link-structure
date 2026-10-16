@@ -28,6 +28,10 @@ pub fn run_detection(
     transport: &dyn HttpTransport,
 ) -> anyhow::Result<RunReport> {
     let started = web_time_utc();
+    let competitors = crate::competitors::validate(config)?;
+    if !config.network.enabled && !candidates.is_empty() {
+        anyhow::bail!("network is disabled; refusing candidate fetches");
+    }
     let mut warnings: Vec<String> = Vec::new();
 
     // ---- Validate config ----
@@ -45,9 +49,9 @@ pub fn run_detection(
     }
     let mut owned_hosts: HashSet<String> = HashSet::new();
     for d in &config.owned_domains {
-        owned_hosts.insert(d.to_ascii_lowercase());
+        owned_hosts.insert(crate::competitors::identity(d)?);
     }
-    owned_hosts.insert(site.host_ascii().to_string());
+    owned_hosts.insert(crate::competitors::identity(site.host_ascii())?);
 
     // ---- Dedupe candidates, preserving first occurrence order + provenance ----
     let mut dedupe: HashMap<String, &ImportedCandidate> = HashMap::new();
@@ -56,7 +60,11 @@ pub fn run_detection(
     for c in candidates {
         match safe_parse(&c.url) {
             Ok(u) => {
-                let key = crate::neturl::dedupe_key(&u);
+                let key = if c.backlink_hints.is_empty() {
+                    crate::neturl::dedupe_key(&u)
+                } else {
+                    crate::competitors::source_key(&c.url)?
+                };
                 match dedupe.entry(key.clone()) {
                     std::collections::hash_map::Entry::Occupied(o) => {
                         duplicates.push(o.key().clone());
@@ -110,7 +118,10 @@ pub fn run_detection(
         .iter()
         .filter_map(|t| {
             let u = safe_parse(&t.url).ok()?;
-            if !owned_hosts.contains(u.host_ascii()) {
+            if !owned_hosts
+                .iter()
+                .any(|d| crate::competitors::within(u.host_ascii(), d))
+            {
                 return None;
             }
             Some(Tp {
@@ -134,7 +145,10 @@ pub fn run_detection(
         let host = url.host_ascii().to_string();
 
         // ---- Static exclusions (no fetch) ----
-        if owned_hosts.contains(&host) {
+        if owned_hosts
+            .iter()
+            .any(|d| crate::competitors::within(&host, d))
+        {
             records.push(record_rejected(
                 cand,
                 "source is a first-party/owned domain",
@@ -275,6 +289,11 @@ pub fn run_detection(
         // ---- Analyze for mention + curated-lead rules ----
         let analysis = detector::analyze_page(&body, &facts);
         let mut rec_opps: Vec<Opportunity> = Vec::new();
+        if !cand.backlink_hints.is_empty() {
+            if let Some(gap) = crate::gap::observe(&body, &facts, config, &competitors) {
+                rec_opps.push(gap);
+            }
+        }
         if let Some(m) = analysis.mention {
             rec_opps.push(m);
         }
@@ -437,6 +456,11 @@ pub fn run_detection(
         warnings,
         zero_result_note: zero_note,
         audit,
+        backlink_imports: candidates
+            .iter()
+            .filter(|c| !c.backlink_hints.is_empty())
+            .map(|c| (c.url.clone(), c.backlink_hints.clone()))
+            .collect(),
     })
 }
 

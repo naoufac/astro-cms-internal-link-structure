@@ -98,6 +98,7 @@ fn from_provider_export(item: &Value) -> anyhow::Result<Vec<ImportedCandidate>> 
                 .and_then(|d| d.as_str())
                 .map(String::from),
             suggested_target: None,
+            backlink_hints: vec![],
         });
     }
     Ok(out)
@@ -109,6 +110,7 @@ fn from_neutral(item: &Value) -> anyhow::Result<ImportedCandidate> {
         .and_then(|u| u.as_str())
         .ok_or_else(|| anyhow::anyhow!("candidate missing 'url'"))?;
     Ok(ImportedCandidate {
+        backlink_hints: vec![],
         url: url.to_string(),
         query: item.get("query").and_then(|q| q.as_str()).map(String::from),
         provider: item

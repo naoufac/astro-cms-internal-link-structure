@@ -19,6 +19,7 @@ fn config(network_enabled: bool, evidence: Option<&str>, limits: Option<Limits>)
             topics: vec!["tarot".into()],
         }],
         excluded_domains: vec![],
+        competitor_domains: vec![],
         limits: limits.unwrap_or_default(),
         network: NetworkPolicy {
             enabled: network_enabled,
@@ -37,6 +38,7 @@ fn cand(url: &str) -> ImportedCandidate {
         search_title: None,
         search_snippet: None,
         suggested_target: None,
+        backlink_hints: vec![],
     }
 }
 
@@ -234,10 +236,6 @@ fn candidate_limit_enforced() {
 
 #[test]
 fn network_disabled_refuses_to_run() {
-    // run_detection itself doesn't check the flag (the CLI does), but
-    // evidence_dir=None + disabled flag must still not fetch: verify via
-    // transport that no requests happen when candidates are all rejected
-    // statically. Here: verify the config flag is echoed into the report.
     let t = FakeTransport::new(&[]);
     let cfg = config(false, None, None);
     let report = run_detection(&cfg, &[], "cfg", "cands", &t).unwrap();
