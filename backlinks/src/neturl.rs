@@ -163,11 +163,12 @@ impl SafeUrl {
 /// Page-dedupe key: normalized URL with trailing slash collapsed (except the
 /// bare origin root), so `/x` and `/x/` count as one page.
 pub fn dedupe_key(u: &SafeUrl) -> String {
-    let mut s = u.normalized.as_str().to_string();
-    if s.len() > u.origin_key().len() && s.ends_with('/') {
-        s.pop();
+    let mut normalized = u.normalized.clone();
+    let path = normalized.path().trim_end_matches('/').to_string();
+    if !path.is_empty() {
+        normalized.set_path(&path);
     }
-    s
+    normalized.to_string()
 }
 
 /// True when the host string consists solely of hex digits, dots, and

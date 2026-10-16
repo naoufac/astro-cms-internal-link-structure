@@ -72,22 +72,28 @@ fn is_provider_export(v: &Value) -> bool {
 }
 
 fn from_provider_export(item: &Value) -> anyhow::Result<Vec<ImportedCandidate>> {
+    if item["response"]["success"] == false
+        || !item["response"]["error"].is_null()
+        || !item["response"]["data"]["error"].is_null()
+    {
+        anyhow::bail!("provider acquisition failed; import is not an empty successful search");
+    }
     let query = item
         .get("query")
         .and_then(|q| q.as_str())
         .unwrap_or("")
         .to_string();
     let mut out = Vec::new();
-    let web = item["response"]["data"]["web"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    let web = item["response"]["data"]["web"].as_array().ok_or_else(|| {
+        anyhow::anyhow!("malformed provider export: response.data.web must be an array")
+    })?;
     for w in web {
         out.push(ImportedCandidate {
             url: w
                 .get("url")
                 .and_then(|u| u.as_str())
-                .unwrap_or("")
+                .filter(|u| !u.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("provider result missing nonempty url"))?
                 .to_string(),
             query: Some(query.clone()),
             provider: Some("imported-provider".to_string()),

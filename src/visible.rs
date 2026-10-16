@@ -68,9 +68,12 @@ fn walk(el: ElementRef<'_>, out: &mut String, unlinked: bool) {
             el.value().name(),
             "script" | "style" | "template" | "noscript"
         )
-        || (unlinked && (noneditorial(el) || matches!(el.value().name(), "a" | "area")))
     {
         out.push(' ');
+        return;
+    }
+    if unlinked && (noneditorial(el) || matches!(el.value().name(), "a" | "area")) {
+        out.push('\0');
         return;
     }
     if !unlinked && matches!(el.value().name(), "img" | "area") {
@@ -107,6 +110,23 @@ pub fn anchor(el: ElementRef<'_>) -> String {
     }
     let mut out = String::new();
     walk(el, &mut out, false);
+    if out.trim().is_empty() {
+        if let Some(id) = el
+            .attr("aria-labelledby")
+            .and_then(|s| s.split_whitespace().next())
+        {
+            if let Some(target) = el
+                .ancestors()
+                .last()
+                .into_iter()
+                .flat_map(|root| root.descendants())
+                .filter_map(ElementRef::wrap)
+                .find(|e| e.attr("id") == Some(id))
+            {
+                out = target.text().collect::<String>();
+            }
+        }
+    }
     if out.trim().is_empty() {
         out = el
             .attr("aria-label")

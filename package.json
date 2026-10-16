@@ -6,7 +6,12 @@
   "license": "MIT",
   "author": "naoufac",
   "engines": { "node": ">=22.12.0" },
-  "exports": { ".": { "types": "./js/index.d.ts", "import": "./js/index.js" } },
+  "exports": {
+    ".": { "types": "./js/index.d.ts", "import": "./js/index.js" },
+    "./js/cli.js": "./js/cli.js",
+    "./native/*": "./native/*"
+  },
+  "bin": { "astro-cms-link-audit": "./js/cli.js" },
   "files": ["js/", "native/", "scripts/", "src/", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "RUST-API.md", "README.md", "LICENSE"],
   "scripts": {
     "build": "node scripts/build.mjs",

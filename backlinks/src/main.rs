@@ -33,18 +33,58 @@ fn parse_args(args: &[String]) -> Result<(String, HashMap<String, String>), Stri
     if sub == "--help" || sub == "-h" || sub == "help" {
         return Err(format!("help\n\n{USAGE}"));
     }
+    let allowed: &[&str] = match sub.as_str() {
+        "generate-queries" => &["config", "output"],
+        "detect" => &["config", "candidates", "backlinks", "output"],
+        _ => return Err(format!("unknown subcommand '{sub}'\n\n{USAGE}")),
+    };
     let mut map = HashMap::new();
     while let Some(a) = it.next() {
         let key = a.trim_start_matches("--").to_string();
         if *a == key {
             return Err(format!("unexpected positional argument '{a}'\n\n{USAGE}"));
         }
+        if !allowed.contains(&key.as_str()) {
+            return Err(format!("unknown flag '{a}'\n\n{USAGE}"));
+        }
+        if map.contains_key(&key) {
+            return Err(format!("duplicate flag '{a}'\n\n{USAGE}"));
+        }
         let val = it
             .next()
             .ok_or_else(|| format!("missing value for --{key}\n\n{USAGE}"))?;
+        if val.starts_with("--") || val.is_empty() {
+            return Err(format!("missing value for --{key}\n\n{USAGE}"));
+        }
         map.insert(key, val.clone());
     }
+    if !map.contains_key("config") {
+        return Err(format!("--config <config.json> is required\n\n{USAGE}"));
+    }
+    if sub == "detect" {
+        if !map.contains_key("output") {
+            return Err(format!("--output <report.json> is required\n\n{USAGE}"));
+        }
+        if map.contains_key("candidates") == map.contains_key("backlinks") {
+            return Err(format!(
+                "Supply exactly one of --candidates or --backlinks\n\n{USAGE}"
+            ));
+        }
+    }
     Ok((sub, map))
+}
+
+fn write_new_output(path: &str, content: &str) -> Result<(), String> {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| {
+            format!("cannot create new output '{path}' (existing files are never overwritten): {e}")
+        })?;
+    file.write_all(content.as_bytes())
+        .map_err(|e| format!("cannot write '{path}': {e}"))
 }
 
 fn read_config(path: &str) -> Result<DetectorConfig, String> {
@@ -98,7 +138,7 @@ fn run_generate_queries(opts: &HashMap<String, String>) -> Result<ExitCode, Stri
                     })?;
                 }
             }
-            std::fs::write(path, json + "\n").map_err(|e| format!("cannot write '{path}': {e}"))?;
+            write_new_output(path, &(json + "\n"))?;
             println!("queries written: {path}");
         }
         None => println!("{json}"),
@@ -124,12 +164,15 @@ fn run_detect(opts: &HashMap<String, String>) -> Result<ExitCode, String> {
 
     let text = std::fs::read_to_string(cand_path)
         .map_err(|e| format!("cannot read candidates '{cand_path}': {e}"))?;
-    let candidates = if opts.contains_key("backlinks") {
-        parse_backlinks(&text, &config).map_err(|e| format!("invalid backlink import: {e}"))?
+    let (candidates, import_summary) = if opts.contains_key("backlinks") {
+        (
+            parse_backlinks(&text, &config).map_err(|e| format!("invalid backlink import: {e}"))?,
+            None,
+        )
     } else {
-        parse_candidates(&text)
-            .map_err(|e| format!("invalid candidates file: {e}"))?
-            .0
+        let (candidates, summary) =
+            parse_candidates(&text).map_err(|e| format!("invalid candidates file: {e}"))?;
+        (candidates, Some(summary))
     };
     if candidates.is_empty() {
         eprintln!("no usable candidates in '{cand_path}'; writing honest empty report");
@@ -144,11 +187,29 @@ fn run_detect(opts: &HashMap<String, String>) -> Result<ExitCode, String> {
                 .to_string(),
         );
     }
-    let transport = PinnedReqwestTransport::new(config.limits.timeout_seconds)
-        .map_err(|e| format!("cannot build transport: {e}"))?;
+    let transport = PinnedReqwestTransport::with_body_limit(
+        config.limits.timeout_seconds,
+        config.limits.max_body_bytes,
+    )
+    .map_err(|e| format!("cannot build transport: {e}"))?;
 
-    let report = run_detection(&config, &candidates, cfg_path, cand_path, &transport)
+    let mut report = run_detection(&config, &candidates, cfg_path, cand_path, &transport)
         .map_err(|e| format!("detection failed: {e}"))?;
+    if let Some(summary) = import_summary {
+        report.counters.candidates_input = summary.input;
+        let removed = report
+            .audit
+            .get("duplicates_removed")
+            .and_then(|n| n.parse::<usize>().ok())
+            .unwrap_or(0);
+        report.audit.insert(
+            "duplicates_removed".into(),
+            (removed + summary.duplicates.len()).to_string(),
+        );
+        report
+            .audit
+            .insert("import_unique".into(), summary.unique.to_string());
+    }
 
     let json =
         serde_json::to_string_pretty(&report).map_err(|e| format!("serialize report: {e}"))?;
@@ -158,7 +219,7 @@ fn run_detect(opts: &HashMap<String, String>) -> Result<ExitCode, String> {
                 .map_err(|e| format!("cannot create output dir '{}': {e}", parent.display()))?;
         }
     }
-    std::fs::write(out_path, json + "\n").map_err(|e| format!("cannot write '{out_path}': {e}"))?;
+    write_new_output(out_path, &(json + "\n"))?;
     println!(
         "report written: {out_path} (opportunities: {}, candidates fetched: {}, rejected: {})",
         report.opportunities.len(),

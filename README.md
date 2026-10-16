@@ -27,7 +27,7 @@ npm run gate
 npm pack --pack-destination /tmp
 ```
 
-`npm run build` explicitly runs `cargo build --release --locked` and copies `target/release/astro-cms-internal-link-structure` to `native/<platform>-<arch>/astro-cms-internal-link-structure`. There is no install, prepare or postinstall compilation/download hook. Build before packing. A local tarball contains the native executable for the machine on which it was built, plus Rust source, Cargo.lock and the toolchain file. It is not a portable or universal binary. Linux libc/loader compatibility still matters. Rebuild from the included source on other platforms, or supply `binaryPath` pointing to a compatible version of this engine. A missing or non-executable binary is always an error, never a silent JS fallback.
+`npm run build` explicitly runs `cargo build --release --locked --message-format=json` and copies the executable path reported by Cargo to `native/<platform>-<arch>/astro-cms-internal-link-structure`. This honors Cargo's actual target directory, including `CARGO_TARGET_DIR` and Cargo configuration, rather than assuming `target/release`. Before replacing the bundle, it runs a local fixture probe and rejects engines missing the metadata, editorial graph, sitemap or anchor fields required by the JS consumer; matching schema/version strings alone are not sufficient. There is no install, prepare or postinstall compilation/download hook. Build before packing. A local tarball contains the native executable for the machine on which it was built, plus Rust source, Cargo.lock and the toolchain file. It is not a portable or universal binary. Linux libc/loader compatibility still matters. Rebuild from the included source on other platforms, or supply `binaryPath` pointing to a compatible version of this engine. A missing or non-executable binary is always an error, never a silent JS fallback.
 
 Install the resulting tarball in a separate Astro consumer:
 
@@ -69,7 +69,7 @@ export default defineConfig({
 
 `astro:config:done` captures `site`, `base`, `trailingSlash` and `build.format` from the resolved Astro config and rejects any explicit option override that conflicts with them. `astro:build:done` scans the actual output directory Astro reports, not an assumed `dist` path. The integration does not run scans during development.
 
-The default report is `<Astro root>/.astro-link-reports/report.json`, outside generated/public output. Relative integration report paths resolve against the Astro root. Reports inside the actual output or public directory are rejected, including through symlink aliases. Enforce writes the native report before throwing for threshold violations. Invalid options, failed or incomplete scans and missing binaries fail in both modes. A configuration/runtime failure may have no report; an old report must never be taken as proof of a successful latest scan.
+The default report is `<Astro root>/.astro-link-reports/report.json`, outside generated/public output. Relative integration report paths resolve against the Astro root. Reports inside the actual output or public directory are rejected, including through symlink aliases. Enforce writes the selected JSON report and text summary before throwing for threshold violations. Invalid options, failed or incomplete scans and missing binaries fail in both modes. A configuration/runtime failure may have no report; an old report must never be taken as proof of a successful latest scan.
 
 ## Options
 
@@ -81,7 +81,13 @@ Options apply to `internalLinkStructure(options)` (Astro integration) and `audit
 | `hierarchy` | `defineStructure()` result | none | Explicit parent/label maps plus `requireChildToParent`, `requireParentToChild`, `requireBreadcrumbs`, `breadcrumbSelector`, `rootLabel`. Parent relations are never guessed from folder names. |
 | `entrypoints` | `string[]` | base root in the selected format | Explicit emitted page keys used as reachability roots. |
 | `thresholds` | object | `brokenPaths: 0`, `brokenFragments: 0`, `hierarchyViolations: 0` | Nonnegative integer limits: `brokenPaths`, `brokenFragments`, `orphans`, `unreachable`, `maxDepth`, `hierarchyViolations`. A gate violates when the observed value strictly exceeds the limit. `{}` disables all threshold gates but never bypasses configuration or scan failures. |
-| `reportPath` | `string` | `.astro-link-reports/report.json` | Integration paths resolve against the Astro root; standalone paths resolve against the current directory. Must stay outside generated output and `public/`. |
+| `reportPath` | `string` | integration: `<root>/.astro-link-reports/report.json`; standalone: `<artifactRoot parent>/.astro-link-reports/report.json` | Explicit relative integration paths resolve against the Astro root; standalone paths resolve against cwd, not the config file. All outputs must stay outside generated output and `public/`, be distinct and not overwrite inputs. |
+| `reportFormat` | `'compact' \| 'full'` | `'compact'` | Selects the JSON stored at `reportPath`; does not change the full API return value or CLI `--raw` output. |
+| `fullReportPath` | `string` | none | Optional additional full JSON, exactly the native stdout bytes, alongside the selected report. |
+| `summaryPath` | `string` | `<reportPath>.txt` | Human-readable summary, including all findings, written in both formats. |
+| `baselinePath` | `string` | none | Previously saved full or compact complete report with matching audit scope. Adds new/existing/resolved comparison to compact JSON and text, not full native JSON. |
+| `gscPath` | `string` | none | Local imported GSC JSON file, never fetched. Adds `gsc` prioritization to compact JSON and text, not full native JSON. |
+| `gscMinImpressions` | `number` | `10` | Positive integer minimum for GSC page reviews; review position range is 8-20 inclusive. |
 | `originAliases` | `string[]` | `[]` | Additional bare HTTP(S) origins treated as internal. Never fetched. |
 | `exclude` | `string[]` | `[]` | Exact page keys removed from eligibility and traversal. Not globs. |
 | `excludePagePaths` | `string[]` | `[]` | Same semantics as `exclude`; both are applied. |
@@ -113,7 +119,89 @@ const report = await auditArtifacts({
 console.log(report.issues, report.opportunities);
 ```
 
-`auditArtifacts(options): Promise<Report>` returns the real native report unchanged. Report bytes on disk are exactly the native stdout JSON.
+`auditArtifacts(options): Promise<Report>` returns the full native report unchanged (`schema: '1'`), including nodes and edges. By default, `reportPath` instead stores compact `astro-link-summary/1` JSON and `<reportPath>.txt` stores its human summary. This API/disk distinction is intentional. Use `reportFormat: 'full'` to store exactly the native stdout bytes at `reportPath`, or set `fullReportPath` to retain a separate full report while keeping the compact default. Baseline comparison and GSC additions appear only in the compact report and text summary. Full native JSON and the API return value do not contain those JS-derived additions. Compact storage does not avoid generating and parsing the full native report in memory; stdout is limited to 128 MiB.
+
+## Node CLI
+
+After installing the local tarball, save this as `audit.config.json` in a consumer with an existing static `dist/` directory:
+
+```json
+{
+  "artifactRoot": "./dist",
+  "site": "https://example.com",
+  "mode": "audit",
+  "reportPath": "./reports/links.json",
+  "fullReportPath": "./reports/full.json",
+  "summaryPath": "./reports/links.txt",
+  "timeoutMs": 300000
+}
+```
+
+```sh
+npm exec --offline -- astro-cms-link-audit --config audit.config.json
+npm exec --offline -- astro-cms-link-audit --config audit.config.json --raw > reports/raw.json
+```
+
+The first command prints the human summary. `--raw` prints the full native JSON (not the compact file), including on enforce failure when a report exists; the failure summary and diagnostic go to stderr. Exit codes are `0` for audit/passing enforce, `1` for enforce violations with a saved report, `2` for configuration/runtime errors. Errors without a report print diagnostics only on stderr. A previous file is not evidence that a failed scan produced a new report. `timeoutMs` is a configurable native subprocess deadline in milliseconds (default 120000), not a deadline for JS post-processing. The example raises it to five minutes; omit it to use the default. Relative config values resolve from the process cwd, not the JSON file's directory.
+
+For direct Node invocation, the package exports `astro-cms-internal-link-structure/js/cli.js`. Native binary paths are exported under `astro-cms-internal-link-structure/native/*` and can be located with `import.meta.resolve()`; they are executables, not JS modules.
+
+## Baseline comparison
+
+Keep an earlier complete report at a separate path before rerunning, for example after the first command above:
+
+```sh
+cp reports/links.json reports/baseline.json
+```
+
+Save `baseline.config.json` (the input and output must not be the same file):
+
+```json
+{
+  "artifactRoot": "./dist",
+  "site": "https://example.com",
+  "reportPath": "./reports/compared.json",
+  "baselinePath": "./reports/baseline.json"
+}
+```
+
+```sh
+npm exec --offline -- astro-cms-link-audit --config baseline.config.json
+```
+
+Both full `schema: '1'` and compact `astro-link-summary/1` baselines are accepted. Site, aliases, base, build format, trailing slash, entrypoints, exclusions and hierarchy scope must match. Incomplete baselines/current scans cannot establish resolved findings. Compact `findings[].status` is `new` or `existing`; `comparison` contains counts plus resolved findings. Existing critical findings remain visible and still affect configured gates. A baseline does not turn enforce into a new-findings-only gate.
+
+## Optional offline GSC workflow
+
+Export measurements separately; the auditor never calls GSC. Save a neutral local import as `gsc.json`, replacing these illustrative measurements with your real exported rows:
+
+```json
+{
+  "rows": [
+    { "page": "https://example.com/", "query": "home guide", "clicks": 2, "impressions": 100, "ctr": 0.02, "position": 12 }
+  ]
+}
+```
+
+Save `gsc.config.json`:
+
+```json
+{
+  "artifactRoot": "./dist",
+  "site": "https://example.com",
+  "reportPath": "./reports/gsc-links.json",
+  "gscPath": "./gsc.json",
+  "gscMinImpressions": 10
+}
+```
+
+```sh
+npm exec --offline -- astro-cms-link-audit --config gsc.config.json
+```
+
+Imports also support raw `{dimensions: ['page', 'query'], rows: [{keys: [...], clicks, impressions, ctr, position}]}` and saved wrappers `{domain, kind: 'page' | 'query' | 'page-query', start: 'YYYY-MM-DD', end: 'YYYY-MM-DD', result: {rows: [...]}}` with matching dimensional keys. Use `rows: []` for an empty import. Do not mix dimensional and neutral rows, duplicate dimensional rows, or page totals and query-page rows for one page. Domains must match the audit site/aliases. Page-only query relevance is unknown; query-only rows are counted, never arbitrarily joined to pages.
+
+Compact `gsc` contains `priorities`, `excluded`, `missingArtifacts`, input counts and scope/basis. Eligible pages with sufficient impressions and position 8-20 are scored by `impressions * (21 - position) * relevanceFactor / (1 + distinctEditorialSources)`, where the factor is 1.5 for a title-matching query, otherwise 1. Noindex/noncanonical pages are excluded. Missing artifacts have unknown HTTP status, not a proven 404. This historical-data heuristic is a review order, not predicted traffic or ranking gains.
 
 ## Standalone native CLI
 
@@ -143,18 +231,28 @@ Exit codes: `0` successful audit or passing enforce, `1` enforce threshold viola
 
 ## Report schema
 
-The report is deterministic for identical artifacts and configuration. Top-level fields:
+The report is deterministic for identical artifacts and configuration.
+
+### Default compact JSON (`astro-link-summary/1`)
+
+Top-level fields are `schema`, `engineVersion`, `config`, `coverage`, `gates`, `counts`, `findings`, `comparison`, `issues` (broken paths/fragments only), `hierarchy`, `opportunities`, `sitemap`, optional `gsc`, `omitted` and `basis`. There are no `nodes` or `edges`, or external/special href inventories. `counts` includes full/editorial edge occurrences, distinct editorial pairs, reachability/depth, eligibility and finding/occurrence totals. Findings are deduplicated with stable `id`, `rule`, `severity`, `source`, `target`, `evidence`, `detail`, `occurrences` and optional baseline `status`. Every finding is retained; compact does not mean a top-N truncation. Finding-heavy compact reports can be larger than full JSON.
+
+### Full native JSON (`schema: '1'`)
+
+This is the API return, native stdout, Node CLI `--raw` output and explicit full-file format. Top-level fields:
 
 - `schema`: `'1'` (note: the request field is `schemaVersion`, the report field is `schema`).
 - `engineVersion`: native engine version string.
 - `coverage`: `totalPages`, `scannedPages` (after exclusions), `assets`, `excludedPages`, `complete`, and `scanIncompleteReason` when a page could not be read.
-- `config`: `site`, `originAliases`, `basePath`, `trailingSlash`, `buildFormat`, `mode`, `entrypoints` actually used.
-- `nodes`: one record per eligible page: `path` (page key), `file` (path under artifactRoot), `depth` from entrypoints, `orphan` (no inbound internal page links), `unreachable` (not reachable from entrypoints), `inCycle`.
-- `edges`: `{source, target, href, landmark, rel}` per internal page-to-page link, where `target` is the normalized page key.
+- `config`: `site`, `originAliases`, `basePath`, `trailingSlash`, `buildFormat`, `mode`, `entrypoints` actually used, plus `auditScope` for exclusions and hierarchy.
+- `nodes`: one record per non-excluded page: `path` (page key), `file` (path under artifactRoot), `depth` from entrypoints, `orphan` (no distinct inbound internal page source), `unreachable`, `inCycle`, `editorialDepth`, `editorialOrphan`, `editorialUnreachable`, `editorialSources`, and `metadata` (title, canonical evidence/status, robots/noindex, eligibility and offline basis). Metadata eligibility is local indexing evidence, not verified Google indexation. Editorial graph metrics exclude menu/hidden/noneditorial links and nofollow support.
+- `edges`: `{source, target, href, landmark, rel, editorial, anchor}` per internal page-to-page link, where `target` is the normalized page key. Anchor evidence recognizes visible text, image alt, and empty-text fallback via the first same-document `aria-labelledby` ID, then aria-label/title. The first matching document ID wins. This is not a full accessibility tree.
 - `issues`: `brokenPaths` (`{source, href, resolved, reason}`), `brokenFragments` (`{source, href, target, fragment, reason}`), `external` (origin to source/href list), `special` (mailto/tel/unparseable/outside-base hrefs).
 - `hierarchy`: `configured`, `cycles`, `missingParents`, `violations` (`{kind, page, related, detail}`) for missing child-to-parent links, missing parent-to-child links, missing breadcrumbs, cycles and unknown parents.
 - `opportunities`: engine-derived advisory records (`{kind, source, target, detail}`). `hierarchy` records a missing configured child-to-parent or parent-to-child link. `contextual` records a source page whose visible unlinked body text contains the target's own label (or `<title>` as fallback) verbatim as a phrase of at least two words, with source and target eligible, distinct and not already linked; sibling relations and URL similarity are never used as evidence.
 - `gates`: `mode`, `outcomes` (`{name, observed, limit, violated}`) and `violated`.
+- `sitemap`: local `files`, URL count, consistency `issues` and offline `basis`; no remote sitemap is fetched.
+- `anchorFindings`: advisory vague/ambiguous anchor evidence (`{kind, source, target, anchor, detail}`), not enforce thresholds.
 
 Reports can contain private page text and paths; keep them out of public output and review before sharing.
 

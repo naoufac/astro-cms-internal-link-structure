@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
-use robots_txt::Robots;
+pub use crate::robots::RobotsRules;
 
 use crate::neturl::{ip_is_global, safe_parse, SafeUrl};
 use crate::report::Limits;
@@ -47,28 +47,6 @@ impl std::fmt::Display for FetchError {
 }
 
 impl std::error::Error for FetchError {}
-
-/// Owned extraction of the UA-relevant robots rules (order preserved).
-#[derive(Debug, Clone)]
-pub struct RobotsRules {
-    /// (allow, path-prefix) in file order; first matching prefix decides.
-    pub rules: Vec<(bool, String)>,
-}
-
-impl RobotsRules {
-    /// First-match prefix decision, mirroring robots_txt's SimpleMatcher.
-    pub fn path_allowed(&self, path: &str) -> bool {
-        for (allow, prefix) in &self.rules {
-            if prefix.is_empty() {
-                return true;
-            }
-            if prefix.len() <= path.len() && path[..prefix.len()].eq_ignore_ascii_case(prefix) {
-                return *allow;
-            }
-        }
-        true
-    }
-}
 
 /// Robots gate result for one origin.
 #[derive(Debug, Clone)]
@@ -115,14 +93,7 @@ pub fn check_robots(
         Ok(resp) => match resp.status {
             200..=299 => {
                 let text = String::from_utf8_lossy(&resp.body).to_string();
-                let robots = Robots::from_str_lossy(&text);
-                let section = robots.choose_section(user_agent);
-                let rules = section
-                    .rules
-                    .iter()
-                    .map(|r| (r.allow, r.path.to_string()))
-                    .collect();
-                RobotsOutcome::Fetched(RobotsRules { rules })
+                RobotsOutcome::Fetched(RobotsRules::parse(&text, user_agent))
             }
             404 | 410 => RobotsOutcome::Absent,
             s => RobotsOutcome::Unavailable(format!("robots.txt HTTP {s}")),
@@ -179,29 +150,10 @@ pub fn gated_get(
     robots_cache: &mut HashMap<String, RobotsOutcome>,
 ) -> Result<FetchOutcome, FetchError> {
     let url = safe_parse(raw_url).map_err(|e| FetchError::UnsafeTarget(e.0))?;
-    let origin = url.origin_key();
-    let path = url.path_and_query();
-    let is_robots = path.ends_with("/robots.txt");
-
-    let mut robots_note = None;
-    if !is_robots {
-        let outcome = robots_for_origin(&origin, user_agent, limits, transport, robots_cache);
-        match &outcome {
-            RobotsOutcome::Unavailable(r) => return Err(FetchError::RobotsUnavailable(r.clone())),
-            RobotsOutcome::Fetched(_) => {
-                outcome
-                    .path_allowed(user_agent, &path)
-                    .map_err(FetchError::RobotsDisallowed)?;
-                robots_note = Some("robots.txt consulted; path allowed".to_string());
-            }
-            RobotsOutcome::Absent => {
-                robots_note = Some("robots.txt absent; no restrictions".to_string());
-            }
-        }
+    if url.normalized.path() == "/robots.txt" {
+        return fetch_with_redirects(&url, limits, transport, user_agent);
     }
-    let mut out = fetch_with_redirects(&url, limits, transport, user_agent)?;
-    out.robots_note = robots_note;
-    Ok(out)
+    fetch_redirects(&url, limits, transport, user_agent, Some(robots_cache))
 }
 
 /// Follow redirects manually. Every hop: safety-parse, DNS-vet, dial pinned.
@@ -212,6 +164,16 @@ pub fn fetch_with_redirects(
     transport: &dyn HttpTransport,
     user_agent: &str,
 ) -> Result<FetchOutcome, FetchError> {
+    fetch_redirects(url, limits, transport, user_agent, None)
+}
+
+fn fetch_redirects(
+    url: &SafeUrl,
+    limits: &Limits,
+    transport: &dyn HttpTransport,
+    user_agent: &str,
+    mut robots_cache: Option<&mut HashMap<String, RobotsOutcome>>,
+) -> Result<FetchOutcome, FetchError> {
     let mut current = url.clone();
     let mut chain: Vec<String> = Vec::new();
     let mut visited: HashSet<String> = HashSet::new();
@@ -221,6 +183,30 @@ pub fn fetch_with_redirects(
         current.path_and_query()
     ));
     loop {
+        let mut robots_note = None;
+        if let Some(cache) = robots_cache.as_deref_mut() {
+            let outcome =
+                robots_for_origin(&current.origin_key(), user_agent, limits, transport, cache);
+            match &outcome {
+                RobotsOutcome::Unavailable(reason) => {
+                    return Err(FetchError::RobotsUnavailable(format!(
+                        "{}: {reason}",
+                        current.as_str()
+                    )))
+                }
+                RobotsOutcome::Fetched(_) => {
+                    outcome
+                        .path_allowed(user_agent, &current.path_and_query())
+                        .map_err(|reason| {
+                            FetchError::RobotsDisallowed(format!("{}: {reason}", current.as_str()))
+                        })?;
+                    robots_note = Some("robots.txt consulted; path allowed".to_string());
+                }
+                RobotsOutcome::Absent => {
+                    robots_note = Some("robots.txt absent; no restrictions".to_string())
+                }
+            }
+        }
         let ips = vetted_ips(&current, transport);
         let Some(ip) = ips.into_iter().next() else {
             return Err(FetchError::Unreachable(format!(
@@ -237,7 +223,16 @@ pub fn fetch_with_redirects(
                 &current.path_and_query(),
                 user_agent,
             )
-            .map_err(|e| FetchError::Unreachable(e.to_string()))?;
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::FileTooLarge {
+                    FetchError::BodyTooLarge
+                } else {
+                    FetchError::Unreachable(e.to_string())
+                }
+            })?;
+        if resp.body.len() > limits.max_body_bytes {
+            return Err(FetchError::BodyTooLarge);
+        }
         if (300..400).contains(&resp.status) {
             let Some(loc) = resp.location else {
                 return Err(FetchError::UnsafeRedirect(
@@ -275,16 +270,13 @@ pub fn fetch_with_redirects(
             current = next_safe;
             continue;
         }
-        if resp.body.len() > limits.max_body_bytes {
-            return Err(FetchError::BodyTooLarge);
-        }
         return Ok(FetchOutcome {
             status: resp.status,
             final_url: current.normalized.to_string(),
             body: resp.body,
             redirect_chain: chain,
             content_type: resp.content_type,
-            robots_note: None,
+            robots_note,
         });
     }
 }

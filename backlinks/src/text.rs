@@ -85,7 +85,35 @@ const BLOCK_TAGS: &[&str] = &[
     "figcaption",
     "pre",
     "div",
+    "main",
+    "section",
+    "article",
+    "body",
+    "ul",
+    "ol",
+    "dl",
+    "table",
+    "tr",
+    "figure",
+    "address",
+    "hr",
 ];
+
+pub(crate) fn heading_level(name: &str) -> Option<u8> {
+    match name {
+        "h1" => Some(1),
+        "h2" => Some(2),
+        "h3" => Some(3),
+        "h4" => Some(4),
+        "h5" => Some(5),
+        "h6" => Some(6),
+        _ => None,
+    }
+}
+
+fn is_block(name: &str) -> bool {
+    BLOCK_TAGS.contains(&name) || heading_level(name).is_some()
+}
 
 /// A visible text region with its origin kind.
 #[derive(Debug, Clone)]
@@ -95,39 +123,68 @@ pub struct TextRegion {
     pub kind: &'static str,
 }
 
-fn is_in_excluded(el: scraper::ElementRef) -> bool {
+pub(crate) fn is_in_excluded(el: scraper::ElementRef) -> bool {
     EXCLUDED_TEXT_TAGS.contains(&el.value().name())
+        || el.attr("hidden").is_some()
+        || el
+            .attr("aria-hidden")
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+        || el.attr("style").is_some_and(|style| {
+            style.split(';').any(|declaration| {
+                let Some((name, value)) = declaration.split_once(':') else {
+                    return false;
+                };
+                let value = value.split('!').next().unwrap_or("").trim();
+                (name.trim().eq_ignore_ascii_case("display") && value.eq_ignore_ascii_case("none"))
+                    || (name.trim().eq_ignore_ascii_case("visibility")
+                        && (value.eq_ignore_ascii_case("hidden")
+                            || value.eq_ignore_ascii_case("collapse")))
+            })
+        })
 }
 
-/// Walk ancestors of an element; true when any is an excluded tag.
-fn has_excluded_ancestor(el: scraper::ElementRef) -> bool {
-    let mut anc = el.parent();
-    while let Some(a) = anc {
-        if let Some(elt) = ElementRef::wrap(a) {
-            if is_in_excluded(elt) {
-                return true;
+pub(crate) fn has_excluded_ancestor(el: scraper::ElementRef) -> bool {
+    el.ancestors()
+        .filter_map(ElementRef::wrap)
+        .any(is_in_excluded)
+}
+
+pub(crate) fn element_text(el: &scraper::ElementRef) -> String {
+    if is_in_excluded(*el) {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut stack = el
+        .children()
+        .rev()
+        .map(|node| (node, false))
+        .collect::<Vec<_>>();
+    while let Some((node, closing)) = stack.pop() {
+        if let Some(text) = node.value().as_text() {
+            out.push_str(text);
+        } else if let Some(element) = ElementRef::wrap(node) {
+            if is_in_excluded(element) {
+                continue;
+            }
+            let block = is_block(element.value().name()) || element.value().name() == "br";
+            if block {
+                out.push(' ');
+            }
+            if !closing {
+                if block {
+                    stack.push((node, true));
+                }
+                stack.extend(element.children().rev().map(|child| (child, false)));
             }
         }
-        anc = a.parent();
     }
-    false
-}
-
-fn element_text(el: &scraper::ElementRef) -> String {
-    // Visible text with entities decoded. A middle dot marks child-element
-    // boundaries (e.g. "Resources<em>Books</em>" reads "Resources \u{b7} Books").
-    let parts: Vec<String> = el
-        .text()
-        .map(decode_entities)
-        .map(|t| t.trim().to_string())
-        .filter(|t| !t.is_empty())
-        .collect();
-    collapse_ws(&parts.join(" \u{b7} "))
+    collapse_ws(&out)
 }
 
 /// Decode the five HTML named entities plus numeric forms. scraper's
 /// `.text()` yields raw entity text, which would otherwise break
 /// substring verification of quotes against raw HTML.
+#[cfg(test)]
 fn decode_entities(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let bytes = s.as_bytes();
@@ -199,42 +256,55 @@ pub fn visible_regions(html: &str) -> Vec<TextRegion> {
         return Vec::new();
     };
 
-    let mut regions: Vec<TextRegion> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-
-    for el in body.descendants().filter_map(scraper::ElementRef::wrap) {
-        let name = el.value().name();
-        let is_heading = matches!(name, "h1" | "h2" | "h3" | "h4" | "h5" | "h6");
-        let is_block = BLOCK_TAGS.contains(&name);
-        if !is_heading && !is_block {
-            continue;
+    fn flush(regions: &mut Vec<TextRegion>, buffer: &mut String, kind: &'static str) {
+        let text = collapse_ws(buffer);
+        if !text.is_empty() {
+            regions.push(TextRegion { text, kind });
         }
-        if has_excluded_ancestor(el) {
-            continue;
-        }
-        // Innermost block only: skip if it contains another block/heading.
-        let contains_block = el
-            .descendants()
-            .filter_map(scraper::ElementRef::wrap)
-            .any(|d| {
-                d.id() != el.id()
-                    && (BLOCK_TAGS.contains(&d.value().name())
-                        || matches!(d.value().name(), "h1" | "h2" | "h3" | "h4" | "h5" | "h6"))
-            });
-        if contains_block {
-            continue;
-        }
-        let text = element_text(&el);
-        if text.is_empty() {
-            continue;
-        }
-        if seen.insert(format!("{name}|{text}")) {
-            regions.push(TextRegion {
-                text,
-                kind: if is_heading { "heading" } else { "main_text" },
-            });
+        buffer.clear();
+    }
+    let mut regions = Vec::new();
+    let mut buffer = String::new();
+    if is_in_excluded(body) {
+        return regions;
+    }
+    let mut stack = body
+        .children()
+        .rev()
+        .map(|node| (node, "main_text", false))
+        .collect::<Vec<_>>();
+    while let Some((node, kind, closing)) = stack.pop() {
+        if closing {
+            flush(&mut regions, &mut buffer, kind);
+        } else if let Some(text) = node.value().as_text() {
+            buffer.push_str(text);
+        } else if let Some(element) = ElementRef::wrap(node) {
+            if is_in_excluded(element) {
+                continue;
+            }
+            let name = element.value().name();
+            if is_block(name) {
+                flush(&mut regions, &mut buffer, kind);
+                let child_kind = if heading_level(name).is_some() {
+                    "heading"
+                } else {
+                    "main_text"
+                };
+                stack.push((node, child_kind, true));
+                stack.extend(
+                    element
+                        .children()
+                        .rev()
+                        .map(|child| (child, child_kind, false)),
+                );
+            } else if name == "br" {
+                buffer.push(' ');
+            } else {
+                stack.extend(element.children().rev().map(|child| (child, kind, false)));
+            }
         }
     }
+    flush(&mut regions, &mut buffer, "main_text");
     regions
 }
 
@@ -301,8 +371,6 @@ pub fn sentence_containing(html: &str, brand: &str) -> Option<String> {
 pub fn word_count(s: &str) -> usize {
     s.unicode_words().count()
 }
-
-use std::collections::HashSet;
 
 #[cfg(test)]
 mod tests {

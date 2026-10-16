@@ -1,0 +1,12 @@
+[
+  {
+    "source_url": "https://source.example/resources?topic=tarot",
+    "competitor_url": "https://one.example/tarot",
+    "provenance": "Synthetic offline example, competitor one row"
+  },
+  {
+    "source_url": "https://SOURCE.example:443/resources?topic=tarot#links",
+    "competitor_url": "https://www.two.example/tarot",
+    "provenance": "Synthetic offline example, competitor two row"
+  }
+]

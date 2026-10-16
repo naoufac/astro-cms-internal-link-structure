@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "site_origin": "https://owned.example",
+  "owned_domains": ["owned.example"],
+  "brands": ["Synthetic Brand"],
+  "target_pages": [
+    {"url": "https://owned.example/tarot", "title": "Tarot", "topics": ["tarot"]}
+  ],
+  "competitor_domains": ["one.example", "two.example"],
+  "excluded_domains": [],
+  "limits": {"candidate_pages": 1, "outbound_checks": 2, "per_origin_delay_ms": 1500},
+  "network": {"enabled": false, "user_agent": "backlink-opportunities-detector/0.1", "evidence_dir": null}
+}

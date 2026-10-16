@@ -234,3 +234,42 @@ fn editorial_all_ancestors_and_anchor_text_evidence() {
     assert_eq!(p.links[5].anchor, "Map destination");
     assert!(!p.links[6].editorial);
 }
+
+#[test]
+fn contextual_never_bridges_removed_visible_link_spans() {
+    let r = run_fixture("removed-links", &[
+        ("index.html", "<main><p>Split <a href='/other/'>unrelated</a> Phrase</p><p>Hidden <span style='display:none'>noise</span> Phrase</p><p>Inline <em>Phrase</em></p></main>"),
+        ("other/index.html", "<title>Other</title>"),
+        ("split/index.html", "<title>Split Phrase</title>"),
+        ("hidden/index.html", "<title>Hidden Phrase</title>"),
+        ("inline/index.html", "<title>Inline Phrase</title>"),
+    ]);
+    let opportunities = r["opportunities"].as_array().unwrap();
+    assert!(
+        !opportunities.iter().any(|o| o["target"] == "/split/"),
+        "invented phrase across existing visible link: {opportunities:?}"
+    );
+    for target in ["/hidden/", "/inline/"] {
+        assert!(opportunities.iter().any(|o| o["target"] == target));
+    }
+}
+
+#[test]
+fn aria_labelledby_resolves_first_reference_and_first_document_id() {
+    let r = run_fixture("labelledby", &[
+        ("index.html", "<main><a href='/target/' aria-labelledby='label'><svg></svg></a><span id='label'>Descriptive destination</span><span id='label'>Wrong duplicate</span><span id='second'>Wrong second reference</span><a href='/target/' aria-labelledby='label second'></a><a href='/target/' aria-labelledby='missing second'></a><a href='/target/' aria-labelledby='missing'></a></main>"),
+        ("target/index.html", "<title>Target</title>"),
+    ]);
+    let edges = r["edges"].as_array().unwrap();
+    assert_eq!(edges[0]["anchor"], "Descriptive destination");
+    assert_eq!(edges[1]["anchor"], "Descriptive destination");
+    assert_eq!(edges[2]["anchor"], "");
+    assert_eq!(edges[3]["anchor"], "");
+    let findings = r["anchorFindings"].as_array().unwrap();
+    assert!(!findings
+        .iter()
+        .any(|f| f["kind"] == "vague" && f["anchor"] == "Descriptive destination"));
+    assert!(findings
+        .iter()
+        .any(|f| f["kind"] == "vague" && f["anchor"] == ""));
+}

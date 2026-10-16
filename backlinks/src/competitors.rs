@@ -23,11 +23,9 @@ pub fn identity(domain: &str) -> anyhow::Result<String> {
 }
 
 pub fn within(host: &str, domain: &str) -> bool {
-    let host = host.trim_end_matches('.');
-    let domain = domain
-        .strip_prefix("www.")
-        .unwrap_or(domain)
-        .trim_end_matches('.');
+    let (Ok(host), Ok(domain)) = (identity(host), identity(domain)) else {
+        return false;
+    };
     host == domain || host.ends_with(&format!(".{domain}"))
 }
 

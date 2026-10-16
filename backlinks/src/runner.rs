@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::detector::{self, PageFacts};
 use crate::evidence::Evidence;
-use crate::fetch::{gated_get, FetchError, Pacer};
+use crate::fetch::{gated_get, FetchError};
 use crate::neturl::safe_parse;
 use crate::queries::web_time_utc;
 use crate::report::{
@@ -15,7 +15,7 @@ use crate::report::{
     RunCounters, RunReport, CONFIG_SCHEMA_VERSION, REPORT_SCHEMA_VERSION, RULE_ENGINE_VERSION,
     TOOL_NAME, TOOL_VERSION,
 };
-use crate::text::contains_word;
+use crate::text::sentence_containing;
 use crate::transport::HttpTransport;
 
 /// Run the full detection pipeline over imported candidates.
@@ -33,6 +33,7 @@ pub fn run_detection(
         anyhow::bail!("network is disabled; refusing candidate fetches");
     }
     let mut warnings: Vec<String> = Vec::new();
+    let mut partial = false;
 
     // ---- Validate config ----
     if config.schema_version != CONFIG_SCHEMA_VERSION {
@@ -57,6 +58,7 @@ pub fn run_detection(
     let mut dedupe: HashMap<String, &ImportedCandidate> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
     let mut duplicates: Vec<String> = Vec::new();
+    let mut records: Vec<CandidateRecord> = Vec::new();
     for c in candidates {
         match safe_parse(&c.url) {
             Ok(u) => {
@@ -80,6 +82,7 @@ pub fn run_detection(
                     "candidate URL rejected before queue: {} ({})",
                     c.url, e.0
                 ));
+                records.push(record_rejected(c, &format!("unsafe target: {}", e.0)));
             }
         }
     }
@@ -93,18 +96,19 @@ pub fn run_detection(
         .collect();
 
     // ---- Shared network state ----
-    let mut pacer = Pacer::new(config.limits.per_origin_delay_ms);
+    let paced = crate::pacing::PacedTransport::new(transport, config.limits.per_origin_delay_ms);
+    let transport: &dyn HttpTransport = &paced;
     let mut robots_cache: HashMap<String, crate::fetch::RobotsOutcome> = HashMap::new();
     let mut evidence = Evidence::open(config.network.evidence_dir.as_deref())?;
     let mut outbound_used = 0usize;
     let mut candidate_limit_reached = false;
     let mut outbound_limit_reached = false;
 
-    let mut records: Vec<CandidateRecord> = Vec::new();
     let mut opportunities: Vec<Opportunity> = Vec::new();
     let mut counters = RunCounters {
         candidates_input: candidates.len(),
         candidates_deduplicated: queue.len(),
+        candidates_rejected: records.len(),
         ..Default::default()
     };
 
@@ -131,13 +135,14 @@ pub fn run_detection(
         })
         .collect();
 
-    for (cand, url) in &queue {
-        if records.len() >= config.limits.candidate_pages {
+    for (processed, (cand, url)) in queue.iter().enumerate() {
+        if processed >= config.limits.candidate_pages {
             candidate_limit_reached = true;
+            partial = true;
             warnings.push(format!(
                 "candidate limit {} reached; {} queued candidates skipped",
                 config.limits.candidate_pages,
-                queue.len() - records.len()
+                queue.len() - processed
             ));
             break;
         }
@@ -159,7 +164,7 @@ pub fn run_detection(
         if config
             .excluded_domains
             .iter()
-            .any(|d| host == *d || host.ends_with(&format!(".{d}")))
+            .any(|d| crate::competitors::within(&host, d))
         {
             records.push(record_rejected(cand, "domain is configured excluded"));
             counters.candidates_rejected += 1;
@@ -174,8 +179,6 @@ pub fn run_detection(
             continue;
         }
 
-        pacer.wait(&format!("{}://{}", url.scheme(), host));
-
         // ---- Gated fetch ----
         let fetch = gated_get(
             url.normalized.as_str(),
@@ -187,6 +190,7 @@ pub fn run_detection(
         let fetch = match fetch {
             Ok(f) => f,
             Err(e) => {
+                partial = true;
                 let (outcome, note) = match &e {
                     FetchError::RobotsUnavailable(n) => (
                         CandidateOutcome::Rejected,
@@ -214,16 +218,35 @@ pub fn run_detection(
                     }
                     FetchError::Other(n) => (CandidateOutcome::Error, n.clone()),
                 };
+                warnings.push(format!("source {} not verified: {note}", cand.url));
+                let robots = match &e {
+                    FetchError::RobotsDisallowed(n) => RobotsCheck {
+                        status: "disallowed".into(),
+                        http_status: None,
+                        detail: Some(n.clone()),
+                    },
+                    FetchError::RobotsUnavailable(n) => RobotsCheck {
+                        status: "unavailable".into(),
+                        http_status: None,
+                        detail: Some(n.clone()),
+                    },
+                    _ => robots_check_for(url.as_str(), &robots_cache),
+                };
+                if matches!(outcome, CandidateOutcome::Error)
+                    || matches!(e, FetchError::RobotsUnavailable(_))
+                {
+                    counters.candidates_failed += 1;
+                }
+                if !matches!(outcome, CandidateOutcome::Error) {
+                    counters.candidates_rejected += 1;
+                }
                 records.push(CandidateRecord {
                     url: cand.url.clone(),
                     final_url: None,
                     outcome,
                     notes: note,
                     http_status: None,
-                    robots: robots_check_for(
-                        &format!("{}://{}", url.scheme(), host),
-                        &robots_cache,
-                    ),
+                    robots,
                     capture_file: None,
                     capture_sha256: None,
                     imported_query: cand.query.clone(),
@@ -231,17 +254,45 @@ pub fn run_detection(
                     imported_collected_at: cand.collected_at.clone(),
                     opportunities: vec![],
                 });
-                counters.candidates_rejected += 1;
                 continue;
             }
         };
 
         counters.candidates_fetched += 1;
         let body = String::from_utf8_lossy(&fetch.body).to_string();
-        let capture = evidence
-            .as_mut()
-            .and_then(|ev| ev.save("page", &fetch.final_url, &fetch.body, "html"));
+        let capture = match evidence.as_mut() {
+            Some(ev) => ev.save("page", &fetch.final_url, &fetch.body, "html")?,
+            None => None,
+        };
         let status_ok = (200..300).contains(&fetch.status);
+        let final_source = safe_parse(&fetch.final_url).expect("validated fetch URL");
+        let exclusion = if owned_hosts
+            .iter()
+            .any(|d| crate::competitors::within(final_source.host_ascii(), d))
+        {
+            Some("final source is a first-party/owned domain")
+        } else if config
+            .excluded_domains
+            .iter()
+            .any(|d| crate::competitors::within(final_source.host_ascii(), d))
+        {
+            Some("final source domain is configured excluded")
+        } else if is_blocked_platform(final_source.host_ascii()) {
+            Some("final source is a blocked platform")
+        } else {
+            None
+        };
+        if let Some(reason) = exclusion {
+            let mut record = record_rejected(cand, reason);
+            record.final_url = Some(fetch.final_url.clone());
+            record.http_status = Some(fetch.status);
+            record.robots = robots_check_for(&fetch.final_url, &robots_cache);
+            record.capture_file = capture.as_ref().map(|(f, _)| f.clone());
+            record.capture_sha256 = capture.as_ref().map(|(_, h)| h.clone());
+            records.push(record);
+            counters.candidates_rejected += 1;
+            continue;
+        }
 
         // ---- Shared facts ----
         let facts = PageFacts {
@@ -260,10 +311,15 @@ pub fn run_detection(
                 .iter()
                 .map(|t| (t.url.clone(), t.topics.clone()))
                 .collect(),
-            outbound_limit: config.limits.outbound_links_per_page,
+            outbound_limit: config.limits.outbound_links_per_page.saturating_add(1),
         };
 
         if !status_ok {
+            partial = true;
+            warnings.push(format!(
+                "source {} inaccessible: HTTP {}",
+                fetch.final_url, fetch.status
+            ));
             // Non-200 source page (e.g. 404): the source itself is rejected.
             records.push(CandidateRecord {
                 url: cand.url.clone(),
@@ -274,7 +330,7 @@ pub fn run_detection(
                     fetch.status
                 ),
                 http_status: Some(fetch.status),
-                robots: robots_check_for(&format!("{}://{}", url.scheme(), host), &robots_cache),
+                robots: robots_check_for(&fetch.final_url, &robots_cache),
                 capture_file: capture.as_ref().map(|(f, _)| f.clone()),
                 capture_sha256: capture.as_ref().map(|(_, h)| h.clone()),
                 imported_query: cand.query.clone(),
@@ -289,7 +345,7 @@ pub fn run_detection(
         // ---- Analyze for mention + curated-lead rules ----
         let analysis = detector::analyze_page(&body, &facts);
         let mut rec_opps: Vec<Opportunity> = Vec::new();
-        if !cand.backlink_hints.is_empty() {
+        if !analysis.links_to_owned_domain && !cand.backlink_hints.is_empty() {
             if let Some(gap) = crate::gap::observe(&body, &facts, config, &competitors) {
                 rec_opps.push(gap);
             }
@@ -302,14 +358,30 @@ pub fn run_detection(
         }
 
         // ---- Rule 3: broken-link replacement possibilities (bounded) ----
-        if outbound_used < config.limits.outbound_checks && !targets.is_empty() {
-            for link in &analysis.outbound {
+        if !targets.is_empty() {
+            if analysis.outbound.len() > config.limits.outbound_links_per_page {
+                partial = true;
+                outbound_limit_reached = true;
+                warnings.push(format!(
+                    "outbound per-page limit {} reached on {}",
+                    config.limits.outbound_links_per_page, fetch.final_url
+                ));
+            }
+            for link in analysis
+                .outbound
+                .iter()
+                .take(config.limits.outbound_links_per_page)
+            {
                 if outbound_used >= config.limits.outbound_checks {
                     outbound_limit_reached = true;
+                    partial = true;
+                    warnings.push(format!(
+                        "outbound limit {} reached; verification skipped on {}",
+                        config.limits.outbound_checks, fetch.final_url
+                    ));
                     break;
                 }
                 outbound_used += 1;
-                pacer.wait(&format!("outbound://{}", origin_of(&link.href)));
                 let dest = match gated_get(
                     &link.href,
                     &config.network.user_agent,
@@ -319,6 +391,7 @@ pub fn run_detection(
                 ) {
                     Ok(d) => d,
                     Err(FetchError::UnsafeTarget(n)) => {
+                        partial = true;
                         warnings.push(format!(
                             "outbound {} skipped: unsafe target: {}",
                             link.href, n
@@ -326,6 +399,7 @@ pub fn run_detection(
                         continue;
                     }
                     Err(FetchError::RobotsUnavailable(n)) => {
+                        partial = true;
                         warnings.push(format!(
                             "outbound {} skipped: robots unavailable: {}",
                             link.href, n
@@ -333,6 +407,7 @@ pub fn run_detection(
                         continue;
                     }
                     Err(FetchError::RobotsDisallowed(n)) => {
+                        partial = true;
                         warnings.push(format!(
                             "outbound {} skipped: robots disallowed: {}",
                             link.href, n
@@ -340,20 +415,28 @@ pub fn run_detection(
                         continue;
                     }
                     Err(e) => {
+                        partial = true;
                         warnings.push(format!("outbound {} skipped: {e}", link.href));
                         continue;
                     }
                 };
-                // Only terminal 404/410 counts as broken. Everything else is
-                // not a finding (timeouts/403/soft-404 are never invented).
+                if !(200..300).contains(&dest.status) && !matches!(dest.status, 404 | 410) {
+                    partial = true;
+                    warnings.push(format!(
+                        "outbound {} could not be verified: HTTP {}",
+                        link.href, dest.status
+                    ));
+                    continue;
+                }
                 if matches!(dest.status, 404 | 410) {
                     // Topic relevance is INFERRED and must match configured
                     // target topics against anchor + surrounding page text.
-                    let page_topics: Vec<&Tp> = targets
+                    let page_topics: Vec<(&Tp, String)> = targets
                         .iter()
-                        .filter(|t| {
-                            let hay = format!("{} {}", link.anchor_text, body);
-                            t.topics.iter().any(|tp| contains_word(&hay, tp))
+                        .filter_map(|t| {
+                            t.topics.iter().find_map(|topic| {
+                                sentence_containing(&body, topic).map(|quote| (t, quote))
+                            })
                         })
                         .collect();
                     if page_topics.is_empty() {
@@ -363,7 +446,7 @@ pub fn run_detection(
                         ));
                         continue;
                     }
-                    let chosen = page_topics[0];
+                    let (chosen, quote) = &page_topics[0];
                     let mut opp = detector::build_broken_link_opportunity(
                         &facts,
                         &link.href,
@@ -372,14 +455,15 @@ pub fn run_detection(
                         web_time_utc(),
                         dest.redirect_chain.clone(),
                         &link.anchor_text,
-                        "anchor text and source page text matched configured topic keywords",
+                        quote,
+                        analysis.links_to_owned_domain,
                     );
+                    opp.observed_facts
+                        .push(format!("matched visible source text: {quote}"));
                     opp.target_url = chosen.url.clone();
                     rec_opps.push(opp);
                 }
             }
-        } else if !targets.is_empty() && outbound_used >= config.limits.outbound_checks {
-            outbound_limit_reached = true;
         }
 
         // ---- Record ----
@@ -396,7 +480,7 @@ pub fn run_detection(
             outcome,
             notes: build_notes(&rec_opps),
             http_status: Some(fetch.status),
-            robots: robots_check_for(&format!("{}://{}", url.scheme(), host), &robots_cache),
+            robots: robots_check_for(&fetch.final_url, &robots_cache),
             capture_file: capture.as_ref().map(|(f, _)| f.clone()),
             capture_sha256: capture.as_ref().map(|(_, h)| h.clone()),
             imported_query: cand.query.clone(),
@@ -408,12 +492,16 @@ pub fn run_detection(
     }
 
     let finished = web_time_utc();
-    counters.candidates_rejected += 0; // already counted inline
+
     counters.outbound_checked = outbound_used;
     counters.outbound_limit_reached = outbound_limit_reached;
     counters.candidate_limit_reached = candidate_limit_reached;
 
-    let run_status = "completed_with_individual_exclusions";
+    let run_status = if partial {
+        "partial"
+    } else {
+        "completed_with_individual_exclusions"
+    };
     let zero_note = if opportunities.is_empty() {
         Some(
             "No opportunities met the evidence rules in this run. Empty categories are honest: \
@@ -447,7 +535,7 @@ pub fn run_detection(
         started_at_utc: started,
         finished_at_utc: finished,
         run_status: run_status.to_string(),
-        partial: !warnings.is_empty(),
+        partial,
         network_enabled: config.network.enabled,
         counters,
         evidence_dir: config.network.evidence_dir.clone(),
@@ -473,12 +561,6 @@ fn build_notes(opps: &[Opportunity]) -> String {
     }
 }
 
-fn origin_of(url: &str) -> String {
-    crate::neturl::safe_parse(url)
-        .map(|u| u.origin_key())
-        .unwrap_or_else(|_| "invalid".to_string())
-}
-
 fn record_rejected(cand: &ImportedCandidate, reason: &str) -> CandidateRecord {
     CandidateRecord {
         url: cand.url.clone(),
@@ -501,16 +583,24 @@ fn record_rejected(cand: &ImportedCandidate, reason: &str) -> CandidateRecord {
 }
 
 fn robots_check_for(
-    origin: &str,
+    raw_url: &str,
     cache: &HashMap<String, crate::fetch::RobotsOutcome>,
 ) -> RobotsCheck {
-    // Snapshot this origin's robots decision for the report.
-    match cache.get(origin) {
+    let url = safe_parse(raw_url).expect("validated URL for robots reporting");
+    match cache.get(&url.origin_key()) {
         Some(outcome) => {
             let (status, detail) = match outcome {
-                crate::fetch::RobotsOutcome::Fetched(_) => {
-                    ("allowed", Some("robots.txt rules applied".to_string()))
-                }
+                crate::fetch::RobotsOutcome::Fetched(rules) => (
+                    if rules.path_allowed(&url.path_and_query()) {
+                        "allowed"
+                    } else {
+                        "disallowed"
+                    },
+                    Some(format!(
+                        "robots.txt rules applied to {}",
+                        url.path_and_query()
+                    )),
+                ),
                 crate::fetch::RobotsOutcome::Absent => (
                     "allowed",
                     Some("robots.txt absent (404/410); no restrictions".to_string()),

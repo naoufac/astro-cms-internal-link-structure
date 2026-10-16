@@ -17,7 +17,7 @@ use crate::neturl::{host_to_ascii, safe_parse, SafeUrl};
 use crate::report::{
     Opportunity, RULE_BROKEN_LINK, RULE_ENGINE_VERSION, RULE_MENTION, RULE_RESOURCE_PAGE,
 };
-use crate::text::{contains_word, full_visible_text, sentence_containing, visible_regions};
+use crate::text::{contains_word, full_visible_text, sentence_containing};
 
 /// One outbound anchor on a source page.
 #[derive(Debug, Clone)]
@@ -53,7 +53,7 @@ pub fn extract_outbound_links(
         if href.is_empty() || href.starts_with('#') {
             continue;
         }
-        let Ok(abs) = source.normalized.join(href) else {
+        let Ok(mut abs) = source.normalized.join(href) else {
             continue;
         };
         if abs.scheme() != "http" && abs.scheme() != "https" {
@@ -65,14 +65,19 @@ pub fn extract_outbound_links(
         let Ok(ascii) = host_to_ascii(host) else {
             continue;
         };
-        if ascii == source_host || owned_hosts.contains(&ascii) {
+        if ascii == source_host
+            || owned_hosts
+                .iter()
+                .any(|d| crate::competitors::within(&ascii, d))
+        {
             continue;
         }
-        let key = format!("{}://{}{}", abs.scheme(), ascii, abs.path());
+        abs.set_fragment(None);
+        let key = abs.to_string();
         if !seen.insert(key) {
             continue;
         }
-        let anchor_text: String = el.text().collect::<Vec<_>>().join(" ");
+        let anchor_text = crate::text::element_text(&el);
         out.push(OutboundLink {
             href: abs.to_string(),
             anchor_text: anchor_text.trim().to_string(),
@@ -115,22 +120,27 @@ pub fn page_links_to_owned_domain(
 
 /// Classify a heading as resource/list-style (structural signal only).
 pub fn heading_is_resource_style(heading: &str) -> bool {
-    let h = heading.to_lowercase();
     for w in [
         "resource",
+        "resources",
         "link",
+        "links",
         "guide",
+        "guides",
         "reading",
-        "bibliograph",
+        "bibliography",
         "reference",
+        "references",
         "further",
         "library",
         "directory",
         "source",
+        "sources",
         "collection",
         "useful",
         "bookmark",
         "tool",
+        "tools",
         "recommended",
         "recommendation",
         "where to",
@@ -138,8 +148,9 @@ pub fn heading_is_resource_style(heading: &str) -> bool {
         "study",
         "media",
         "book",
+        "books",
     ] {
-        if h.contains(w) {
+        if contains_word(heading, w) {
             return true;
         }
     }
@@ -200,6 +211,7 @@ pub fn build_broken_link_opportunity(
     dest_redirect_chain: Vec<String>,
     anchor_text: &str,
     topic_evidence: &str,
+    links_to_owned_domain: bool,
 ) -> Opportunity {
     Opportunity {
         competitor_evidence: None,
@@ -215,7 +227,7 @@ pub fn build_broken_link_opportunity(
         checked_at_utc: dest_checked_at_utc,
         redirect_chain: dest_redirect_chain,
         existing_link_checked: true,
-        links_to_owned_domain: false,
+        links_to_owned_domain,
         source_is_first_party: false,
         observed_facts: vec![
             format!("source page returned HTTP {}", facts.observed_status),
@@ -240,6 +252,14 @@ pub fn analyze_page(html: &str, facts: &PageFacts) -> PageAnalysis {
     };
     let source = src(facts);
     let links_to_owned = page_links_to_owned_domain(html, &source, &facts.owned_hosts);
+    if links_to_owned {
+        return PageAnalysis {
+            links_to_owned_domain: true,
+            mention: None,
+            curated_lead: None,
+            outbound: Vec::new(),
+        };
+    }
 
     // Topical target selection against the page's own visible text: returns
     // (url, matched topic) for the configured target with the most topic
@@ -314,11 +334,7 @@ pub fn analyze_page(html: &str, facts: &PageFacts) -> PageAnalysis {
 
     // Rule 2: curated resource-page lead (heading + grouped external links).
     let mut curated = None;
-    let ext_count = count_external_links(html, &source);
-    let resource_heading = visible_regions(html)
-        .into_iter()
-        .find(|r| r.kind == "heading" && heading_is_resource_style(&r.text));
-    if let Some(h) = resource_heading {
+    if let Some((heading, ext_count)) = crate::sections::resource_group(html, &source) {
         if ext_count >= 3 {
             let Some((target_url, topic_hit)) = topical_target(facts) else {
                 let outbound =
@@ -336,7 +352,7 @@ pub fn analyze_page(html: &str, facts: &PageFacts) -> PageAnalysis {
                 rule_version: RULE_ENGINE_VERSION.to_string(),
                 source_url: facts.source_url.clone(),
                 target_url,
-                evidence_quote: h.text.clone(),
+                evidence_quote: heading.clone(),
                 evidence_location: "heading".to_string(),
                 broken_url: None,
                 broken_final_url: None,
@@ -348,8 +364,8 @@ pub fn analyze_page(html: &str, facts: &PageFacts) -> PageAnalysis {
                 source_is_first_party: false,
                 observed_facts: vec![
                     format!("page returned HTTP {}", facts.observed_status),
-                    format!("resource-style heading observed: '{}'", h.text),
-                    format!("{ext_count} unique external link destinations on page"),
+                    format!("resource-style heading observed: '{heading}'"),
+                    format!("{ext_count} unique external link destinations in heading section"),
                 ],
                 inferred_assessment: vec![
                     "editorial willingness to ADD a new link is INFERRED from page structure, not confirmed"
@@ -531,8 +547,19 @@ mod tests {
         </main></body></html>"#;
         let f = facts("https://source.example/", "https://gissecrets.com/", &[]);
         let a = analyze_page(html, &f);
-        assert_eq!(a.outbound.len(), 1);
-        assert_eq!(a.outbound[0].href, "https://ext.example/x");
+        assert!(a.links_to_owned_domain);
+        assert!(
+            a.outbound.is_empty(),
+            "already-linked pages skip outbound work"
+        );
+        let outbound = extract_outbound_links(
+            html,
+            &safe_parse(&f.source_url).unwrap(),
+            &f.owned_hosts,
+            f.outbound_limit,
+        );
+        assert_eq!(outbound.len(), 1);
+        assert_eq!(outbound[0].href, "https://ext.example/x");
     }
 
     #[test]

@@ -80,19 +80,28 @@ async function outside(reportPath, roots) {
 function execute(binary, request, timeout) {
   return new Promise((accept, reject) => {
     const child = spawn(binary, [], { shell: false, stdio: ['pipe', 'pipe', 'pipe'] });
-    child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
-    let stdout = '', stderr = '', failure;
+    const stdout = [], stderr = [];
+    let stdoutSize = 0, stderrSize = 0, failure;
     const timer = setTimeout(() => { failure = new AuditError('Native engine timed out'); child.kill('SIGKILL'); }, timeout);
     const limit = 128 * 1024 * 1024;
-    child.stdout.on('data', chunk => { stdout += chunk; if (Buffer.byteLength(stdout) > limit) { failure = new AuditError('Native report exceeds 128 MiB'); child.kill('SIGKILL'); } });
-    child.stderr.on('data', chunk => { if (stderr.length < 1024 * 1024) stderr += chunk; });
+    child.stdout.on('data', chunk => {
+      if (failure) return;
+      stdoutSize += chunk.length;
+      if (stdoutSize > limit) { failure = new AuditError('Native report exceeds 128 MiB'); child.kill('SIGKILL'); }
+      else stdout.push(chunk);
+    });
+    child.stderr.on('data', chunk => {
+      const kept = chunk.subarray(0, Math.max(0, 1024 * 1024 - stderrSize));
+      if (kept.length) { stderr.push(kept); stderrSize += kept.length; }
+    });
     child.once('error', cause => { clearTimeout(timer); reject(new AuditError(`Cannot execute native engine at ${binary}: ${cause.message}. Run npm run build from source or supply a compatible binaryPath.`, { cause })); });
     child.stdin.on('error', error => { if (error.code !== 'EPIPE') failure = error; });
     child.once('close', (exitCode, signal) => {
       clearTimeout(timer);
       if (failure) return reject(failure);
-      if (![0, 1].includes(exitCode)) return reject(new AuditError(`Native engine failed (${exitCode ?? signal}): ${stderr.trim()}`, { exitCode }));
-      try { accept({ exitCode, report: JSON.parse(stdout), bytes: stdout }); }
+      if (![0, 1].includes(exitCode)) return reject(new AuditError(`Native engine failed (${exitCode ?? signal}): ${Buffer.concat(stderr, stderrSize).toString('utf8').trim()}`, { exitCode }));
+      const bytes = Buffer.concat(stdout, stdoutSize).toString('utf8');
+      try { accept({ exitCode, report: JSON.parse(bytes), bytes }); }
       catch (cause) { reject(new AuditError('Native engine returned invalid report JSON', { cause, exitCode })); }
     });
     child.stdin.end(JSON.stringify(request));
