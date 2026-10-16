@@ -270,6 +270,15 @@ fn resolve_href(site: &SiteModel, page_key: &str, href: &str) -> Option<Url> {
     base.join(href).ok()
 }
 
+fn same_site_origin(u: &Url, site: &SiteModel) -> bool {
+    let host = u.host_str().unwrap_or("").to_ascii_lowercase();
+    let origin = match u.port() {
+        Some(p) => format!("{}://{}:{}", u.scheme(), host, p),
+        None => format!("{}://{}", u.scheme(), host),
+    };
+    site.origin_aliases.contains(&origin)
+}
+
 pub fn run_prepared(p: &Prepared) -> Result<Report, String> {
     let inv: Inventory = build_inventory(&p.root, &p.site)
         .map_err(|e| format!("scan failure: cannot read artifact root: {e}"))?;
@@ -532,7 +541,7 @@ pub fn run_prepared(p: &Prepared) -> Result<Report, String> {
                         .clone()
                         .unwrap_or_else(|| "[aria-label=\"breadcrumb\"]".to_string());
                     let chain = crate::hierarchy::breadcrumbs_of(hcfg, child);
-                    let ok = page_has_breadcrumb_links(&p.root, crec, &sel, &chain);
+                    let ok = page_has_breadcrumb_links(&p.root, &p.site, crec, child, &sel, &chain);
                     if !ok {
                         hier.violations.push(HierarchyIssue {
                             kind: "breadcrumbsMissing".to_string(),
@@ -674,6 +683,9 @@ pub fn run_prepared(p: &Prepared) -> Result<Report, String> {
 fn links_to(site: &SiteModel, pl: &PageLinks, page_key: &str, target: &str) -> bool {
     for dl in &pl.links {
         if let Some(u) = resolve_href(site, page_key, &dl.href) {
+            if !same_site_origin(&u, site) {
+                continue;
+            }
             let mut un = u.clone();
             un.set_fragment(None);
             let identity = crate::sitemap::path_identity(un.path());
@@ -715,7 +727,9 @@ fn validate_fragment(
 
 fn page_has_breadcrumb_links(
     root: &Path,
+    site: &SiteModel,
     rec: &PageRecord,
+    page_key: &str,
     selector: &str,
     chain: &[(String, String)],
 ) -> bool {
@@ -734,19 +748,20 @@ fn page_has_breadcrumb_links(
     if wanted.is_empty() {
         return false;
     }
-    let format = crate::sitemap::BuildFormat::Directory;
+    let format = site.build_format;
     for bc in doc.select(&sel) {
         let mut found: BTreeSet<String> = BTreeSet::new();
         for a in bc.select(&a_sel) {
             if let Some(href) = a.attr("href") {
-                if let Ok(base) = Url::parse("https://breadcrumb.local/") {
-                    if let Ok(u) = base.join(href) {
-                        let identity = crate::sitemap::path_identity(u.path());
-                        for w in &wanted {
-                            for cand in crate::links::page_key_candidates(&identity, format) {
-                                if cand == *w {
-                                    found.insert(w.clone());
-                                }
+                if let Some(u) = resolve_href(site, page_key, href) {
+                    if !same_site_origin(&u, site) {
+                        continue;
+                    }
+                    let identity = crate::sitemap::path_identity(u.path());
+                    for w in &wanted {
+                        for cand in crate::links::page_key_candidates(&identity, format) {
+                            if cand == *w {
+                                found.insert(w.clone());
                             }
                         }
                     }
@@ -784,44 +799,101 @@ fn unlinked_body_mention(root: &Path, srec: &PageRecord, trec: &PageRecord, phra
         Ok(h) => h,
         Err(_) => return false,
     };
-    if !visible_unlinked_text(html).contains(phrase) {
+    if !contains_whole_phrase(&visible_unlinked_text(html), phrase) {
         return false;
     }
     let _ = trec;
     true
 }
 
-/// Visible text with script/style/nav/footer/aside/header removed and <a>
-/// link text removed (mentions inside links do not count).
+fn contains_whole_phrase(text: &str, phrase: &str) -> bool {
+    let phrase = phrase.trim();
+    if phrase.is_empty() {
+        return false;
+    }
+    for (i, _) in text.match_indices(phrase) {
+        let before_ok = text[..i]
+            .chars()
+            .next_back()
+            .map(|c| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(true);
+        let after = i + phrase.len();
+        let after_ok = text[after..]
+            .chars()
+            .next()
+            .map(|c| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(true);
+        if before_ok && after_ok {
+            return true;
+        }
+    }
+    false
+}
+
 fn visible_unlinked_text(html: &str) -> String {
     let doc = scraper::Html::parse_document(html);
-    let mut excluded: Vec<_> = Vec::new();
+    let mut excluded: BTreeSet<ego_tree::NodeId> = BTreeSet::new();
     for sel_str in [
-        "script", "style", "nav", "footer", "aside", "header", "a", "title", "head",
+        "script",
+        "style",
+        "template",
+        "noscript",
+        "nav",
+        "footer",
+        "aside",
+        "header",
+        "a",
+        "title",
+        "head",
+        "[hidden]",
+        "[aria-hidden=\"true\"]",
     ] {
         if let Ok(sel) = scraper::Selector::parse(sel_str) {
             for el in doc.select(&sel) {
-                excluded.push(el.id());
+                excluded.insert(el.id());
+            }
+        }
+    }
+    if let Ok(all) = scraper::Selector::parse("*") {
+        for el in doc.select(&all) {
+            let Some(style) = el.value().attr("style") else {
+                continue;
+            };
+            let hidden = style.to_ascii_lowercase().split(';').any(|decl| {
+                let mut parts = decl.splitn(2, ':');
+                let prop = parts.next().unwrap_or("").trim();
+                let raw = parts.next().unwrap_or("").trim();
+                let val = raw.strip_suffix("!important").unwrap_or(raw).trim();
+                matches!((prop, val), ("display", "none") | ("visibility", "hidden"))
+            });
+            if hidden {
+                excluded.insert(el.id());
             }
         }
     }
     let mut out = String::new();
-    let root = doc.root_element();
-    fn walk(
-        node: scraper::element_ref::ElementRef<'_>,
-        excluded: &[ego_tree::NodeId],
-        out: &mut String,
-    ) {
-        if excluded.contains(&node.id()) {
-            return;
-        }
-        out.push_str(&node.text().collect::<String>());
-        for child in node.child_elements() {
-            walk(child, excluded, out);
+    walk_visible(doc.root_element(), &excluded, &mut out);
+    out
+}
+
+fn walk_visible(
+    node: scraper::element_ref::ElementRef<'_>,
+    excluded: &BTreeSet<ego_tree::NodeId>,
+    out: &mut String,
+) {
+    for child in node.children() {
+        match child.value() {
+            scraper::node::Node::Text(t) => out.push_str(&t.text),
+            scraper::node::Node::Element(_) => {
+                if let Some(el) = scraper::ElementRef::wrap(child) {
+                    if !excluded.contains(&el.id()) {
+                        walk_visible(el, excluded, out);
+                    }
+                }
+            }
+            _ => {}
         }
     }
-    walk(root, &excluded, &mut out);
-    out
 }
 
 #[cfg(test)]
@@ -1234,6 +1306,210 @@ mod tests {
             "{:?}",
             report.issues.brokenPaths
         );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn breadcrumbs_relative_paths_resolve_against_page_url() {
+        let root = tmpdir("bc-rel");
+        write(
+            &root.join("index.html"),
+            r##"<html><body><a href="/knowledge/docs/">Docs</a><a href="/knowledge/docs/deep/">Deep</a></body></html>"##,
+        );
+        write(
+            &root.join("knowledge/docs/index.html"),
+            r##"<html><body><nav aria-label="breadcrumb"><a href="/">Home</a></nav><a href="deep/">Deep</a></body></html>"##,
+        );
+        write(
+            &root.join("knowledge/docs/deep/index.html"),
+            r##"<html><body><nav aria-label="breadcrumb"><a href="../../../">Home</a><a href="../">Docs</a></nav></body></html>"##,
+        );
+        let json = request_json(
+            &root,
+            serde_json::json!({
+                "hierarchy": {
+                    "parents": {"/knowledge/docs/": "/", "/knowledge/docs/deep/": "/knowledge/docs/"},
+                    "labels": {"/": "Home", "/knowledge/docs/": "Docs"},
+                    "requireChildToParent": true,
+                    "requireBreadcrumbs": true
+                }
+            }),
+        );
+        let p = prepare(&json).unwrap();
+        let report = run_prepared(&p).unwrap();
+        assert!(
+            report.hierarchy.violations.is_empty(),
+            "{:?}",
+            report.hierarchy.violations
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn breadcrumb_external_same_path_does_not_count() {
+        let root = tmpdir("bc-ext");
+        write(
+            &root.join("index.html"),
+            r##"<html><body><a href="/knowledge/docs/">Docs</a><a href="/knowledge/docs/deep/">Deep</a></body></html>"##,
+        );
+        write(
+            &root.join("knowledge/docs/index.html"),
+            r##"<html><body><nav aria-label="breadcrumb"><a href="/">Home</a></nav></body></html>"##,
+        );
+        write(
+            &root.join("knowledge/docs/deep/index.html"),
+            r##"<html><body><nav aria-label="breadcrumb"><a href="https://outside.test/">Home</a><a href="https://outside.test/knowledge/docs/">Docs</a></nav></body></html>"##,
+        );
+        let json = request_json(
+            &root,
+            serde_json::json!({
+                "hierarchy": {
+                    "parents": {"/knowledge/docs/": "/", "/knowledge/docs/deep/": "/knowledge/docs/"},
+                    "labels": {"/": "Home", "/knowledge/docs/": "Docs"},
+                    "requireBreadcrumbs": true
+                }
+            }),
+        );
+        let p = prepare(&json).unwrap();
+        let report = run_prepared(&p).unwrap();
+        assert_eq!(report.hierarchy.violations.len(), 1);
+        assert_eq!(report.hierarchy.violations[0].kind, "breadcrumbsMissing");
+        assert_eq!(report.hierarchy.violations[0].page, "/knowledge/docs/deep/");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn breadcrumb_internal_alias_href_counts() {
+        let root = tmpdir("bc-alias");
+        write(&root.join("index.html"), r##"<html><body></body></html>"##);
+        write(
+            &root.join("docs/index.html"),
+            r##"<html><body><nav aria-label="breadcrumb"><a href="http://e.com/">Home</a></nav></body></html>"##,
+        );
+        let json = request_json(
+            &root,
+            serde_json::json!({
+                "originAliases": ["http://e.com"],
+                "hierarchy": {
+                    "parents": {"/docs/": "/"},
+                    "labels": {"/": "Home"},
+                    "requireBreadcrumbs": true
+                }
+            }),
+        );
+        let p = prepare(&json).unwrap();
+        let report = run_prepared(&p).unwrap();
+        assert!(
+            report.hierarchy.violations.is_empty(),
+            "{:?}",
+            report.hierarchy.violations
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn links_to_rejects_external_origin_with_matching_path() {
+        let root = tmpdir("ext-links-to");
+        write(
+            &root.join("index.html"),
+            r##"<html><body><a href="/docs/">Docs</a></body></html>"##,
+        );
+        write(
+            &root.join("docs/index.html"),
+            r##"<html><body><a href="https://outside.test/">Home</a></body></html>"##,
+        );
+        let json = request_json(
+            &root,
+            serde_json::json!({
+                "hierarchy": {
+                    "parents": {"/docs/": "/"},
+                    "labels": {"/": "Home"},
+                    "requireChildToParent": true
+                }
+            }),
+        );
+        let p = prepare(&json).unwrap();
+        let report = run_prepared(&p).unwrap();
+        assert!(report
+            .hierarchy
+            .violations
+            .iter()
+            .any(|v| v.kind == "childToParentLinkMissing" && v.page == "/docs/"));
+        assert_eq!(report.opportunities.len(), 1);
+        assert_eq!(report.opportunities[0].kind, "hierarchy");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn contains_whole_phrase_boundaries() {
+        assert!(contains_whole_phrase(
+            "the Deep Sky Guide today",
+            "Deep Sky Guide"
+        ));
+        assert!(contains_whole_phrase("(Deep Sky Guide)", "Deep Sky Guide"));
+        assert!(!contains_whole_phrase(
+            "Deep Sky Guidebook",
+            "Deep Sky Guide"
+        ));
+        assert!(!contains_whole_phrase("xDeep Sky Guide", "Deep Sky Guide"));
+        assert!(!contains_whole_phrase("Deep Sky Guides", "Deep Sky Guide"));
+        assert!(contains_whole_phrase("lise café list", "café"));
+        assert!(!contains_whole_phrase("cafés list", "café"));
+        assert!(!contains_whole_phrase("any text", "   "));
+    }
+
+    #[test]
+    fn contextual_excludes_hidden_and_nonvisible_mentions() {
+        let root = tmpdir("ctx-hidden");
+        write(
+            &root.join("index.html"),
+            r##"<html><body><a href="/docs/a/">A</a><a href="/docs/b/">B</a></body></html>"##,
+        );
+        write(
+            &root.join("docs/a/index.html"),
+            r##"<html><body><a href="/">Home</a><p>placeholder</p></body></html>"##,
+        );
+        write(
+            &root.join("docs/b/index.html"),
+            r##"<html><body><title>Deep Sky Guide</title><a href="/">Home</a><p>charts</p></body></html>"##,
+        );
+        let cases: &[(&str, usize)] = &[
+            ("<header>Deep Sky Guide</header>", 0),
+            ("<nav>Deep Sky Guide</nav>", 0),
+            ("<p hidden>Deep Sky Guide</p>", 0),
+            ("<p style=\"display:none\">Deep Sky Guide</p>", 0),
+            ("<p style=\"display:none !important\">Deep Sky Guide</p>", 0),
+            ("<p style=\"visibility:hidden\">Deep Sky Guide</p>", 0),
+            ("<div aria-hidden=\"true\">Deep Sky Guide</div>", 0),
+            ("<noscript>Deep Sky Guide</noscript>", 0),
+            ("<template>Deep Sky Guide</template>", 0),
+            ("<p>Deep Sky Guidebook</p>", 0),
+            ("<p>Read the Deep Sky Guide today.</p>", 1),
+        ];
+        let json = request_json(
+            &root,
+            serde_json::json!({
+                "hierarchy": {
+                    "parents": {"/docs/a/": "/docs/", "/docs/b/": "/docs/"},
+                    "requireChildToParent": false,
+                    "requireParentToChild": false
+                }
+            }),
+        );
+        for (body, expected) in cases {
+            write(
+                &root.join("docs/a/index.html"),
+                &format!(r##"<html><body><a href="/">Home</a>{body}</body></html>"##),
+            );
+            let p = prepare(&json).unwrap();
+            let report = run_prepared(&p).unwrap();
+            let n = report
+                .opportunities
+                .iter()
+                .filter(|o| o.kind == "contextual")
+                .count();
+            assert_eq!(n, *expected, "case body: {body}");
+        }
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

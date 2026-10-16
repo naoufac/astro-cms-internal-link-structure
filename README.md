@@ -188,7 +188,7 @@ External prospect scanning belongs to the independent `backlinks/` Rust crate in
 
 The full fixture matrix is enforced by `test/astro.mjs` on a real Astro build: directory and file formats, root and `/knowledge` base, and `trailingSlash` always/never/ignore, including deterministic repeat reports, byte-identical artifacts with the integration disabled, broken-link enforce failure with a saved report and audit-mode success on the same broken fixture. `npm run gate` must pass on the matching native source and binary before release; it fails if the engine is missing or any permutation regresses.
 
-The audit sees emitted static HTML and local assets, not client-rendered runtime navigation, authenticated routes or a deployed server's redirects. It does not verify external HTTP status, guarantee indexation or improve rankings by itself. No production edits or deployment are performed.
+The audit sees emitted static HTML and local assets, not client-rendered runtime navigation, authenticated routes or a deployed server's redirects. Contextual text filtering recognizes excluded HTML elements, hidden attributes and basic inline hiding styles; it does not compute stylesheet visibility or execute JavaScript. Review opportunity findings before acting on them. It does not verify external HTTP status, guarantee indexation or improve rankings by itself. No production edits or deployment are performed.
 
 Integration hook reference: https://docs.astro.build/en/reference/integrations-reference/
 
